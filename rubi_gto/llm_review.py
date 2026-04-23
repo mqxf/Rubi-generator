@@ -12,7 +12,7 @@ import urllib.request
 
 from .annotator import validate_annotation
 from .io_utils import read_json, write_json
-from .japanese import apply_reading_conflict_choices, extract_reading_conflicts
+from .japanese import apply_reading_conflict_choices, extract_reading_conflicts, reading_conflict_signature
 from .annotator import strip_rubi
 from .progress import NullProgress
 
@@ -113,6 +113,13 @@ class ReviewCandidate:
             source_id=payload.get("source_id"),
             reason=payload.get("reason"),
         )
+
+
+@dataclass(slots=True)
+class ReviewCandidateGroup:
+    representative: ReviewCandidate
+    candidates: list[ReviewCandidate]
+    conflict_signature: str | None
 
 
 class StructuredResponseClient(Protocol):
@@ -357,6 +364,38 @@ def _selected_candidates(
     return selected
 
 
+def _candidate_conflict_signature(candidate: ReviewCandidate) -> str | None:
+    if candidate.category != "reading_only_conflict":
+        return None
+    return reading_conflict_signature(
+        candidate.source_text,
+        candidate.option_a.get("annotated_text", ""),
+        candidate.option_b.get("annotated_text", ""),
+    )
+
+
+def _group_selected_candidates(selected: list[ReviewCandidate]) -> list[ReviewCandidateGroup]:
+    groups: list[ReviewCandidateGroup] = []
+    grouped_indices: dict[tuple[str, str], int] = {}
+    for candidate in selected:
+        signature = _candidate_conflict_signature(candidate)
+        if signature:
+            key = (candidate.category, signature)
+            existing_index = grouped_indices.get(key)
+            if existing_index is not None:
+                groups[existing_index].candidates.append(candidate)
+                continue
+            grouped_indices[key] = len(groups)
+        groups.append(
+            ReviewCandidateGroup(
+                representative=candidate,
+                candidates=[candidate],
+                conflict_signature=signature,
+            )
+        )
+    return groups
+
+
 def _candidate_prompt_payload(candidate: ReviewCandidate) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "id": candidate.record_id,
@@ -509,6 +548,20 @@ def _resolve_candidate_output(candidate: ReviewCandidate, payload: dict[str, Any
     return None, ["unknown_resolution_type"]
 
 
+def _apply_group_resolution(
+    candidate: ReviewCandidate,
+    resolution_payload: dict[str, Any],
+    *,
+    fallback_choice: str | None = None,
+) -> tuple[str | None, list[str]]:
+    if fallback_choice is not None:
+        payload = dict(resolution_payload)
+        payload["resolution_type"] = "pick_option"
+        payload["option_choice"] = fallback_choice
+        return _resolve_candidate_output(candidate, payload)
+    return _resolve_candidate_output(candidate, resolution_payload)
+
+
 def _result_entry(
     candidate: ReviewCandidate,
     *,
@@ -516,6 +569,9 @@ def _result_entry(
     model: str,
     resolution_payload: dict[str, Any] | None,
     annotated_text: str | None,
+    representative_record_id: str | None = None,
+    grouped_record_ids: list[str] | None = None,
+    conflict_signature: str | None = None,
     error: str | None = None,
     validation_issues: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -533,6 +589,9 @@ def _result_entry(
         "resolution_type": (resolution_payload or {}).get("resolution_type", ""),
         "option_choice": (resolution_payload or {}).get("option_choice", "none"),
         "conflict_choices": list((resolution_payload or {}).get("conflict_choices", [])),
+        "representative_record_id": representative_record_id or candidate.record_id,
+        "grouped_record_ids": list(grouped_record_ids or [candidate.record_id]),
+        "conflict_signature": conflict_signature or "",
         "validation_issues": list(validation_issues or []),
         "error": error,
     }
@@ -611,6 +670,8 @@ def _llm_review_report_payload(results_payload: dict[str, Any]) -> dict[str, Any
             category: dict(sorted(counts.items())) for category, counts in sorted(category_status_counts.items())
         },
         "last_run_status_counts": dict(results_payload.get("last_run_status_counts", {})),
+        "selected_group_count": int(results_payload.get("selected_group_count", 0)),
+        "last_run_group_ids": list(results_payload.get("last_run_group_ids", [])),
         "last_run_record_ids": last_run_record_ids,
         "last_run_records": last_run_records,
     }
@@ -634,9 +695,10 @@ def llm_review(
 ) -> dict[str, Any]:
     candidates = _load_review_candidates(workspace)
     selected = _selected_candidates(candidates, categories=categories, record_ids=record_ids, limit=limit)
+    groups = _group_selected_candidates(selected)
     env_loaded = _load_env_file(workspace / ".env")
     reporter = progress or NullProgress()
-    reporter.stage("LLM Review", f"{len(selected)}/{len(candidates)} selected")
+    reporter.stage("LLM Review", f"{len(selected)}/{len(candidates)} selected groups={len(groups)}")
 
     existing_suggestions = read_json(workspace / GENERATED_LLM_SUGGESTIONS_PATH, default={})
     existing_results_payload = read_json(workspace / GENERATED_LLM_REVIEW_RESULTS_PATH, default={"results": {}})
@@ -646,8 +708,10 @@ def llm_review(
     if selected and resolved_client is None:
         resolved_client = OpenAIResponsesHTTPClient(base_url=base_url, timeout=request_timeout_seconds)
 
-    for index, candidate in enumerate(selected, start=1):
-        reporter.item("LLM", index, len(selected), candidate.record_id, candidate.category)
+    for index, group in enumerate(groups, start=1):
+        candidate = group.representative
+        group_record_ids = [item.record_id for item in group.candidates]
+        reporter.item("LLM", index, len(groups), candidate.record_id, f"{candidate.category} x{len(group.candidates)}")
         prompt = _build_input_text(candidate)
         try:
             assert resolved_client is not None
@@ -664,170 +728,204 @@ def llm_review(
                 min_request_interval_seconds=min_request_interval_seconds,
                 progress=reporter,
             )
-            annotated_text, resolution_issues = _resolve_candidate_output(candidate, resolution)
-            if resolution_issues:
-                fallback_annotation, fallback_choice = _fallback_annotation(candidate)
-                if fallback_annotation:
-                    fallback_payload = dict(resolution)
-                    fallback_payload["resolution_type"] = "pick_option"
-                    fallback_payload["option_choice"] = fallback_choice
-                    existing_suggestions[candidate.record_id] = _suggestion_entry(
+            group_fallback_annotation, group_fallback_choice = _fallback_annotation(candidate)
+            fallback_payload = dict(resolution)
+            fallback_payload["resolution_type"] = "pick_option"
+            fallback_payload["option_choice"] = group_fallback_choice
+            for member in group.candidates:
+                annotated_text, resolution_issues = _apply_group_resolution(member, resolution)
+                if resolution_issues:
+                    fallback_annotation, _ = _apply_group_resolution(
+                        member,
+                        fallback_payload,
+                        fallback_choice=group_fallback_choice,
+                    ) if group_fallback_annotation else (None, [])
+                    if fallback_annotation:
+                        existing_suggestions[member.record_id] = _suggestion_entry(
+                            model=model,
+                            candidate=member,
+                            payload=fallback_payload,
+                            annotated_text=fallback_annotation,
+                        )
+                        merged_results[member.record_id] = _result_entry(
+                            member,
+                            status="fallback_suggested",
+                            model=model,
+                            resolution_payload=fallback_payload,
+                            annotated_text=fallback_annotation,
+                            representative_record_id=candidate.record_id,
+                            grouped_record_ids=group_record_ids,
+                            conflict_signature=group.conflict_signature,
+                            error=",".join(resolution_issues),
+                            validation_issues=[],
+                        )
+                        run_counts["fallback_suggested"] += 1
+                        continue
+                    existing_suggestions.pop(member.record_id, None)
+                    merged_results[member.record_id] = _result_entry(
+                        member,
+                        status="error",
                         model=model,
-                        candidate=candidate,
-                        payload=fallback_payload,
-                        annotated_text=fallback_annotation,
-                    )
-                    merged_results[candidate.record_id] = _result_entry(
-                        candidate,
-                        status="fallback_suggested",
-                        model=model,
-                        resolution_payload=fallback_payload,
-                        annotated_text=fallback_annotation,
+                        resolution_payload=resolution,
+                        annotated_text=annotated_text,
+                        representative_record_id=candidate.record_id,
+                        grouped_record_ids=group_record_ids,
+                        conflict_signature=group.conflict_signature,
                         error=",".join(resolution_issues),
                         validation_issues=[],
                     )
-                    run_counts["fallback_suggested"] += 1
-                    reporter.meter("LLM", index, len(selected), detail=candidate.record_id, counts=run_counts)
+                    run_counts["error"] += 1
                     continue
-                existing_suggestions.pop(candidate.record_id, None)
-                merged_results[candidate.record_id] = _result_entry(
-                    candidate,
-                    status="error",
-                    model=model,
-                    resolution_payload=resolution,
-                    annotated_text=annotated_text,
-                    error=",".join(resolution_issues),
-                    validation_issues=[],
-                )
-                run_counts["error"] += 1
-                reporter.meter("LLM", index, len(selected), detail=candidate.record_id, counts=run_counts)
-                continue
 
-            if not annotated_text:
-                fallback_annotation, fallback_choice = _fallback_annotation(candidate)
-                if fallback_annotation:
-                    fallback_payload = dict(resolution)
-                    fallback_payload["resolution_type"] = "pick_option"
-                    fallback_payload["option_choice"] = fallback_choice
-                    existing_suggestions[candidate.record_id] = _suggestion_entry(
+                if not annotated_text:
+                    fallback_annotation, _ = _apply_group_resolution(
+                        member,
+                        fallback_payload,
+                        fallback_choice=group_fallback_choice,
+                    ) if group_fallback_annotation else (None, [])
+                    if fallback_annotation:
+                        existing_suggestions[member.record_id] = _suggestion_entry(
+                            model=model,
+                            candidate=member,
+                            payload=fallback_payload,
+                            annotated_text=fallback_annotation,
+                        )
+                        merged_results[member.record_id] = _result_entry(
+                            member,
+                            status="fallback_suggested",
+                            model=model,
+                            resolution_payload=fallback_payload,
+                            annotated_text=fallback_annotation,
+                            representative_record_id=candidate.record_id,
+                            grouped_record_ids=group_record_ids,
+                            conflict_signature=group.conflict_signature,
+                        )
+                        run_counts["fallback_suggested"] += 1
+                        continue
+                    existing_suggestions.pop(member.record_id, None)
+                    merged_results[member.record_id] = _result_entry(
+                        member,
+                        status="abstained",
                         model=model,
-                        candidate=candidate,
-                        payload=fallback_payload,
-                        annotated_text=fallback_annotation,
+                        resolution_payload=resolution,
+                        annotated_text=None,
+                        representative_record_id=candidate.record_id,
+                        grouped_record_ids=group_record_ids,
+                        conflict_signature=group.conflict_signature,
                     )
-                    merged_results[candidate.record_id] = _result_entry(
-                        candidate,
-                        status="fallback_suggested",
-                        model=model,
-                        resolution_payload=fallback_payload,
-                        annotated_text=fallback_annotation,
-                    )
-                    run_counts["fallback_suggested"] += 1
-                    reporter.meter("LLM", index, len(selected), detail=candidate.record_id, counts=run_counts)
+                    run_counts["abstained"] += 1
                     continue
-                existing_suggestions.pop(candidate.record_id, None)
-                merged_results[candidate.record_id] = _result_entry(
-                    candidate,
-                    status="abstained",
-                    model=model,
-                    resolution_payload=resolution,
-                    annotated_text=None,
-                )
-                run_counts["abstained"] += 1
-                reporter.meter("LLM", index, len(selected), detail=candidate.record_id, counts=run_counts)
-                continue
 
-            validation_issues = validate_annotation(candidate.source_text, annotated_text)
-            if validation_issues:
-                fallback_annotation, fallback_choice = _fallback_annotation(candidate)
-                if fallback_annotation:
-                    fallback_payload = dict(resolution)
-                    fallback_payload["resolution_type"] = "pick_option"
-                    fallback_payload["option_choice"] = fallback_choice
-                    existing_suggestions[candidate.record_id] = _suggestion_entry(
+                validation_issues = validate_annotation(member.source_text, annotated_text)
+                if validation_issues:
+                    fallback_annotation, _ = _apply_group_resolution(
+                        member,
+                        fallback_payload,
+                        fallback_choice=group_fallback_choice,
+                    ) if group_fallback_annotation else (None, [])
+                    if fallback_annotation:
+                        existing_suggestions[member.record_id] = _suggestion_entry(
+                            model=model,
+                            candidate=member,
+                            payload=fallback_payload,
+                            annotated_text=fallback_annotation,
+                        )
+                        merged_results[member.record_id] = _result_entry(
+                            member,
+                            status="fallback_suggested",
+                            model=model,
+                            resolution_payload=fallback_payload,
+                            annotated_text=fallback_annotation,
+                            representative_record_id=candidate.record_id,
+                            grouped_record_ids=group_record_ids,
+                            conflict_signature=group.conflict_signature,
+                            error="invalid_annotation",
+                            validation_issues=validation_issues,
+                        )
+                        run_counts["fallback_suggested"] += 1
+                        continue
+                    existing_suggestions.pop(member.record_id, None)
+                    merged_results[member.record_id] = _result_entry(
+                        member,
+                        status="error",
                         model=model,
-                        candidate=candidate,
-                        payload=fallback_payload,
-                        annotated_text=fallback_annotation,
-                    )
-                    merged_results[candidate.record_id] = _result_entry(
-                        candidate,
-                        status="fallback_suggested",
-                        model=model,
-                        resolution_payload=fallback_payload,
-                        annotated_text=fallback_annotation,
+                        resolution_payload=resolution,
+                        annotated_text=annotated_text,
+                        representative_record_id=candidate.record_id,
+                        grouped_record_ids=group_record_ids,
+                        conflict_signature=group.conflict_signature,
                         error="invalid_annotation",
                         validation_issues=validation_issues,
                     )
-                    run_counts["fallback_suggested"] += 1
-                    reporter.meter("LLM", index, len(selected), detail=candidate.record_id, counts=run_counts)
+                    run_counts["error"] += 1
                     continue
-                existing_suggestions.pop(candidate.record_id, None)
-                merged_results[candidate.record_id] = _result_entry(
-                    candidate,
-                    status="error",
+
+                existing_suggestions[member.record_id] = _suggestion_entry(
+                    model=model,
+                    candidate=member,
+                    payload=resolution,
+                    annotated_text=annotated_text,
+                )
+                merged_results[member.record_id] = _result_entry(
+                    member,
+                    status="suggested",
                     model=model,
                     resolution_payload=resolution,
                     annotated_text=annotated_text,
-                    error="invalid_annotation",
-                    validation_issues=validation_issues,
+                    representative_record_id=candidate.record_id,
+                    grouped_record_ids=group_record_ids,
+                    conflict_signature=group.conflict_signature,
                 )
-                run_counts["error"] += 1
-                reporter.meter("LLM", index, len(selected), detail=candidate.record_id, counts=run_counts)
-                continue
-
-            existing_suggestions[candidate.record_id] = _suggestion_entry(
-                model=model,
-                candidate=candidate,
-                payload=resolution,
-                annotated_text=annotated_text,
-            )
-            merged_results[candidate.record_id] = _result_entry(
-                candidate,
-                status="suggested",
-                model=model,
-                resolution_payload=resolution,
-                annotated_text=annotated_text,
-            )
-            run_counts["suggested"] += 1
-            reporter.meter("LLM", index, len(selected), detail=candidate.record_id, counts=run_counts)
+                run_counts["suggested"] += 1
+            reporter.meter("LLM", index, len(groups), detail=candidate.record_id, counts=run_counts)
         except Exception as exc:
             fallback_annotation, fallback_choice = _fallback_annotation(candidate)
-            if fallback_annotation:
-                fallback_payload = {
-                    "resolution_type": "pick_option",
-                    "option_choice": fallback_choice,
-                    "conflict_choices": [],
-                    "final_annotation": "",
-                }
-                existing_suggestions[candidate.record_id] = _suggestion_entry(
+            fallback_payload = {
+                "resolution_type": "pick_option",
+                "option_choice": fallback_choice,
+                "conflict_choices": [],
+                "final_annotation": "",
+            }
+            for member in group.candidates:
+                resolved_fallback, _ = _apply_group_resolution(
+                    member,
+                    fallback_payload,
+                    fallback_choice=fallback_choice,
+                ) if fallback_annotation else (None, [])
+                if resolved_fallback:
+                    existing_suggestions[member.record_id] = _suggestion_entry(
+                        model=model,
+                        candidate=member,
+                        payload=fallback_payload,
+                        annotated_text=resolved_fallback,
+                    )
+                    merged_results[member.record_id] = _result_entry(
+                        member,
+                        status="fallback_suggested",
+                        model=model,
+                        resolution_payload=fallback_payload,
+                        annotated_text=resolved_fallback,
+                        representative_record_id=candidate.record_id,
+                        grouped_record_ids=group_record_ids,
+                        conflict_signature=group.conflict_signature,
+                        error=str(exc),
+                    )
+                    run_counts["fallback_suggested"] += 1
+                    continue
+                existing_suggestions.pop(member.record_id, None)
+                merged_results[member.record_id] = _result_entry(
+                    member,
+                    status="error",
                     model=model,
-                    candidate=candidate,
-                    payload=fallback_payload,
-                    annotated_text=fallback_annotation,
-                )
-                merged_results[candidate.record_id] = _result_entry(
-                    candidate,
-                    status="fallback_suggested",
-                    model=model,
-                    resolution_payload=fallback_payload,
-                    annotated_text=fallback_annotation,
+                    resolution_payload=None,
+                    annotated_text=None,
+                    representative_record_id=candidate.record_id,
+                    grouped_record_ids=group_record_ids,
+                    conflict_signature=group.conflict_signature,
                     error=str(exc),
                 )
-                run_counts["fallback_suggested"] += 1
-                reporter.meter("LLM", index, len(selected), detail=candidate.record_id, counts=run_counts)
-                continue
-            existing_suggestions.pop(candidate.record_id, None)
-            merged_results[candidate.record_id] = _result_entry(
-                candidate,
-                status="error",
-                model=model,
-                resolution_payload=None,
-                annotated_text=None,
-                error=str(exc),
-            )
-            run_counts["error"] += 1
-            reporter.meter("LLM", index, len(selected), detail=candidate.record_id, counts=run_counts)
+                run_counts["error"] += 1
+            reporter.meter("LLM", index, len(groups), detail=candidate.record_id, counts=run_counts)
 
     write_json(workspace / GENERATED_LLM_SUGGESTIONS_PATH, existing_suggestions)
     results_payload = {
@@ -835,8 +933,10 @@ def llm_review(
         "reasoning_effort": reasoning_effort,
         "candidate_count": len(candidates),
         "selected_candidate_count": len(selected),
+        "selected_group_count": len(groups),
         "aggregate_status_counts": _aggregate_status_counts(merged_results),
         "last_run_status_counts": dict(sorted(run_counts.items())),
+        "last_run_group_ids": [group.representative.record_id for group in groups],
         "last_run_record_ids": [candidate.record_id for candidate in selected],
         "results": merged_results,
     }
@@ -848,6 +948,7 @@ def llm_review(
         "reasoning_effort": reasoning_effort,
         "candidate_count": len(candidates),
         "selected_candidate_count": len(selected),
+        "selected_group_count": len(groups),
         "status_counts": dict(sorted(run_counts.items())),
         "env_loaded": env_loaded,
         "written_suggestions_path": str(GENERATED_LLM_SUGGESTIONS_PATH),

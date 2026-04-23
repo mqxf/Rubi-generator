@@ -123,6 +123,35 @@ class JapaneseTests(unittest.TestCase):
         self.assertEqual(decision.annotated_text, "§^投げつけ(なげつけ)る")
         self.assertEqual(decision.status, "generated")
 
+    def test_trims_trailing_kana_to_match_other_analyzer(self) -> None:
+        class FakeAnnotator(ConsensusAnnotator):
+            def __init__(self) -> None:
+                self.available = True
+
+            def _tokenize_fugashi(self, text: str) -> list[MorphToken]:
+                return [
+                    MorphToken("見つける", "ミツケル", "見つける", "動詞", "一般", "下一段-カ行", "終止形-一般"),
+                    MorphToken("こと", "コト", "こと", "名詞", "普通名詞", "*", "*"),
+                    MorphToken("が", "ガ", "が", "助詞", "*", "*", "*"),
+                    MorphToken("できます", "デキマス", "できる", "動詞", "一般", "上一段-カ行", "終止形-一般"),
+                    MorphToken("。", "", "。", "記号", "*", "*", "*"),
+                ]
+
+            def _tokenize_sudachi(self, text: str) -> list[MorphToken]:
+                return [
+                    MorphToken("見つけ", "ミツケ", "見つける", "動詞", "一般", "下一段-カ行", "連用形-一般"),
+                    MorphToken("る", "ル", "る", "助動詞", "*", "*", "*"),
+                    MorphToken("こと", "コト", "こと", "名詞", "普通名詞", "*", "*"),
+                    MorphToken("が", "ガ", "が", "助詞", "*", "*", "*"),
+                    MorphToken("できます", "デキマス", "できる", "動詞", "一般", "上一段-カ行", "終止形-一般"),
+                    MorphToken("。", "", "。", "記号", "*", "*", "*"),
+                ]
+
+        annotator = FakeAnnotator()
+        decision = annotator.annotate_with_review("見つけることができます。")
+        self.assertEqual(decision.annotated_text, "§^見つけ(みつけ)ることができます。")
+        self.assertEqual(decision.status, "generated")
+
     def test_counter_conflict_prefers_numeric_reading(self) -> None:
         class FakeAnnotator(ConsensusAnnotator):
             def __init__(self) -> None:
@@ -266,6 +295,33 @@ class JapaneseTests(unittest.TestCase):
         self.assertEqual(decision.annotated_text, "§^科学(かがく)§^的(てき)")
         self.assertEqual(decision.status, "generated")
 
+    def test_splits_kana_bearing_compound_when_other_side_splits(self) -> None:
+        class FakeAnnotator(ConsensusAnnotator):
+            def __init__(self) -> None:
+                self.available = True
+                self._jamdict_resolver = JamdictReadingResolver()
+
+            def _tokenize_fugashi(self, text: str) -> list[MorphToken]:
+                return [
+                    MorphToken("その", "ソノ", "その", "連体詞", "*", "*", "*"),
+                    MorphToken("使", "ツカ", "使う", "動詞", "一般", "五段-カ行", "連用形-一般"),
+                    MorphToken("い", "イ", "い", "助詞", "*", "*", "*"),
+                    MorphToken("方", "カタ", "方", "名詞", "普通名詞", "*", "*"),
+                    MorphToken("や", "ヤ", "や", "助詞", "*", "*", "*"),
+                ]
+
+            def _tokenize_sudachi(self, text: str) -> list[MorphToken]:
+                return [
+                    MorphToken("その", "ソノ", "その", "連体詞", "*", "*", "*"),
+                    MorphToken("使い方", "ツカイカタ", "使い方", "名詞", "普通名詞", "*", "*"),
+                    MorphToken("や", "ヤ", "や", "助詞", "*", "*", "*"),
+                ]
+
+        annotator = FakeAnnotator()
+        decision = annotator.annotate_with_review("その使い方や")
+        self.assertEqual(decision.annotated_text, "その§^使(つか)い§^方(かた)や")
+        self.assertEqual(decision.status, "generated")
+
     def test_prefers_fugashi_when_only_dakuten_diff(self) -> None:
         class FakeAnnotator(ConsensusAnnotator):
             def __init__(self) -> None:
@@ -307,6 +363,73 @@ class JapaneseTests(unittest.TestCase):
         decision = annotator.annotate_with_review("等分配カード")
         self.assertEqual(decision.annotated_text, "§^等(とう)§^分配(ぶんぱい)カード")
         self.assertEqual(decision.status, "generated")
+
+    def test_alias_and_compound_split_can_resolve_together(self) -> None:
+        class FakeAnnotator(ConsensusAnnotator):
+            def __init__(self) -> None:
+                self.available = True
+                self._jamdict_resolver = JamdictReadingResolver()
+
+            def _tokenize_fugashi(self, text: str) -> list[MorphToken]:
+                return [
+                    MorphToken("私", "ワタクシ", "私", "代名詞", "*", "*", "*"),
+                    MorphToken("たち", "タチ", "たち", "接尾辞", "*", "*", "*"),
+                    MorphToken("は", "ハ", "は", "助詞", "*", "*", "*"),
+                    MorphToken("呼", "ヨ", "呼ぶ", "動詞", "一般", "五段-バ行", "連用形-一般"),
+                    MorphToken("ん", "ン", "ん", "助動詞", "*", "*", "*"),
+                    MorphToken("で", "デ", "で", "助詞", "*", "*", "*"),
+                    MorphToken("います", "イマス", "いる", "動詞", "一般", "上一段-ア行", "終止形-一般"),
+                    MorphToken("。", "", "。", "記号", "*", "*", "*"),
+                ]
+
+            def _tokenize_sudachi(self, text: str) -> list[MorphToken]:
+                return [
+                    MorphToken("私たち", "ワタシタチ", "私たち", "代名詞", "*", "*", "*"),
+                    MorphToken("は", "ハ", "は", "助詞", "*", "*", "*"),
+                    MorphToken("呼", "ヨ", "呼ぶ", "動詞", "一般", "五段-バ行", "連用形-一般"),
+                    MorphToken("ん", "ン", "ん", "助動詞", "*", "*", "*"),
+                    MorphToken("で", "デ", "で", "助詞", "*", "*", "*"),
+                    MorphToken("います", "イマス", "いる", "動詞", "一般", "上一段-ア行", "終止形-一般"),
+                    MorphToken("。", "", "。", "記号", "*", "*", "*"),
+                ]
+
+        annotator = FakeAnnotator()
+        decision = annotator.annotate_with_review("私たちは呼んでいます。")
+        self.assertEqual(decision.annotated_text, "§^私(わたし)たちは§^呼(よ)んでいます。")
+        self.assertEqual(decision.status, "generated")
+
+    def test_partial_trivial_cleanup_leaves_only_true_conflict(self) -> None:
+        class FakeAnnotator(ConsensusAnnotator):
+            def __init__(self) -> None:
+                self.available = True
+
+            def _tokenize_fugashi(self, text: str) -> list[MorphToken]:
+                return [
+                    MorphToken("使", "ツカ", "使う", "動詞", "一般", "五段-カ行", "連用形-一般"),
+                    MorphToken("い", "イ", "い", "助詞", "*", "*", "*"),
+                    MorphToken("方", "カタ", "方", "名詞", "普通名詞", "*", "*"),
+                    MorphToken("と", "ト", "と", "助詞", "*", "*", "*"),
+                    MorphToken("細", "ホソ", "細", "名詞", "普通名詞", "*", "*"),
+                    MorphToken("断", "ダン", "断", "名詞", "普通名詞", "*", "*"),
+                ]
+
+            def _tokenize_sudachi(self, text: str) -> list[MorphToken]:
+                return [
+                    MorphToken("使い方", "ツカイカタ", "使い方", "名詞", "普通名詞", "*", "*"),
+                    MorphToken("と", "ト", "と", "助詞", "*", "*", "*"),
+                    MorphToken("細断", "サイダン", "細断", "名詞", "普通名詞", "*", "*"),
+                ]
+
+        annotator = FakeAnnotator()
+        decision = annotator.annotate_with_review("使い方と細断")
+        self.assertEqual(decision.status, "review")
+        self.assertEqual(
+            decision.review_options,
+            [
+                {"source": "fugashi+unidic", "annotated_text": "§^使(つか)い§^方(かた)と§^細(ほそ)§^断(だん)"},
+                {"source": "sudachi-full", "annotated_text": "§^使(つか)い§^方(かた)と§^細断(さいだん)"},
+            ],
+        )
 
     def test_preserves_newlines(self) -> None:
         class FakeAnnotator(ConsensusAnnotator):

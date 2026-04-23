@@ -151,12 +151,107 @@ class LLMReviewTests(unittest.TestCase):
                 "§^本当(ほんとう)に§^身体(からだ)が§^不足(ふそく)している",
             )
             self.assertEqual(results["results"]["minecraft:status.body"]["status"], "suggested")
+            self.assertEqual(results["results"]["minecraft:status.body"]["representative_record_id"], "minecraft:status.body")
+            self.assertEqual(results["results"]["minecraft:status.body"]["grouped_record_ids"], ["minecraft:status.body"])
             self.assertEqual(report["aggregate_option_choice_counts"].get("none", 0), 1)
             self.assertEqual(report["aggregate_conflict_choice_counts"]["a"], 1)
             self.assertEqual(report["aggregate_conflict_choice_counts"]["b"], 2)
+            self.assertEqual(report["selected_group_count"], 1)
             self.assertEqual(report["last_run_record_ids"], ["minecraft:status.body"])
             self.assertEqual(report["last_run_records"][0]["annotated_text"], "§^本当(ほんとう)に§^身体(からだ)が§^不足(ふそく)している")
             self.assertIn('"key":"status.body"', str(client.requests[0]["input_text"]))
+
+    def test_llm_review_groups_identical_reading_only_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            _write_json(
+                tmp_path / "review" / "generated" / "review_candidates.json",
+                {
+                    "candidate_count": 2,
+                    "candidates": {
+                        "minecraft:first": {
+                            "id": "minecraft:first",
+                            "namespace": "minecraft",
+                            "key": "first",
+                            "category": "reading_only_conflict",
+                            "source_text": "本当に身体が不足している",
+                            "current_text": "本当に身体が不足している",
+                            "reason": "analyzer_conflict",
+                            "options": [
+                                {
+                                    "source": "fugashi+unidic",
+                                    "annotated_text": "§^本当(ほんと)に§^身体(からだ)が§^不足(ぶそく)している",
+                                },
+                                {
+                                    "source": "sudachi-full",
+                                    "annotated_text": "§^本当(ほんとう)に§^身体(しんたい)が§^不足(ふそく)している",
+                                },
+                            ],
+                            "source_origin": "test",
+                        },
+                        "minecraft:second": {
+                            "id": "minecraft:second",
+                            "namespace": "minecraft",
+                            "key": "second",
+                            "category": "reading_only_conflict",
+                            "source_text": "本当に身体が不足していた",
+                            "current_text": "本当に身体が不足していた",
+                            "reason": "analyzer_conflict",
+                            "options": [
+                                {
+                                    "source": "fugashi+unidic",
+                                    "annotated_text": "§^本当(ほんと)に§^身体(からだ)が§^不足(ぶそく)していた",
+                                },
+                                {
+                                    "source": "sudachi-full",
+                                    "annotated_text": "§^本当(ほんとう)に§^身体(しんたい)が§^不足(ふそく)していた",
+                                },
+                            ],
+                            "source_origin": "test",
+                        },
+                    },
+                },
+            )
+            client = FakeClient(
+                [
+                    {
+                        "resolution_type": "per_conflict",
+                        "option_choice": "none",
+                        "conflict_choices": [
+                            {"index": 0, "choice": "b"},
+                            {"index": 1, "choice": "a"},
+                            {"index": 2, "choice": "b"},
+                        ],
+                        "final_annotation": "",
+                    }
+                ]
+            )
+
+            summary = llm_review(tmp_path, model="gpt-5", client=client)
+
+            suggestions = json.loads((tmp_path / GENERATED_LLM_SUGGESTIONS_PATH).read_text(encoding="utf-8"))
+            results = json.loads((tmp_path / GENERATED_LLM_REVIEW_RESULTS_PATH).read_text(encoding="utf-8"))
+            report = json.loads((tmp_path / GENERATED_LLM_REVIEW_REPORT_PATH).read_text(encoding="utf-8"))
+
+            self.assertEqual(len(client.requests), 1)
+            self.assertEqual(summary["selected_candidate_count"], 2)
+            self.assertEqual(summary["selected_group_count"], 1)
+            self.assertEqual(summary["status_counts"], {"suggested": 2})
+            self.assertEqual(
+                suggestions["minecraft:first"]["annotated_text"],
+                "§^本当(ほんとう)に§^身体(からだ)が§^不足(ふそく)している",
+            )
+            self.assertEqual(
+                suggestions["minecraft:second"]["annotated_text"],
+                "§^本当(ほんとう)に§^身体(からだ)が§^不足(ふそく)していた",
+            )
+            self.assertEqual(results["results"]["minecraft:first"]["representative_record_id"], "minecraft:first")
+            self.assertEqual(
+                results["results"]["minecraft:second"]["grouped_record_ids"],
+                ["minecraft:first", "minecraft:second"],
+            )
+            self.assertEqual(report["selected_group_count"], 1)
+            self.assertEqual(report["last_run_group_ids"], ["minecraft:first"])
 
     def test_llm_review_accepts_merged_annotation_for_compound_conflict(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
