@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import copy
 import fnmatch
 import io
 import json
@@ -12,6 +14,9 @@ from typing import Any
 
 from .models import Record, SourceSpec
 from .progress import NullProgress
+from .snbt import Literal as SnbtLiteral
+from .snbt import dump as dump_snbt
+from .snbt import parse as parse_snbt
 
 
 USER_AGENT = "rubi-gto/0.1"
@@ -43,6 +48,7 @@ GUIDE_TEXT_SUFFIXES = {".md", ".txt"}
 PATCHOULI_JSON_SUFFIXES = {".json", ".json5"}
 PATCHOULI_TEXT_SUFFIXES = {".md", ".txt"}
 JAPANESE_TEXT_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff々ヶ]")
+FTBQUESTS_TRANSLATABLE_FIELDS = {"title", "subtitle", "description"}
 
 
 def load_manifest(manifest_path: Path) -> tuple[dict[str, Any], list[SourceSpec]]:
@@ -214,7 +220,8 @@ def _records_from_json(
                 source=source,
                 output_path=f"assets/{namespace}/lang/{source.locale or 'ja_jp'}.json" if source.json_mode == "lang" else path,
                 source_path=path,
-            ),
+            )
+            | _record_extra_metadata(source),
         )
         for key, value in items.items()
     ]
@@ -245,7 +252,10 @@ def _text_record(
         content_type=content_type,
         output_kind=source.output_kind,
         output_path=output_path,
-        metadata=_record_metadata(source=source, output_path=output_path, source_path=path),
+        metadata=_metadata_with_source_extra(
+            _record_metadata(source=source, output_path=output_path, source_path=path),
+            source,
+        ),
     )
 
 
@@ -287,7 +297,8 @@ def _records_from_generic_json(
                     template_payload=payload,
                     json_path=json_path,
                     source_path=path,
-                ),
+                )
+                | _record_extra_metadata(source),
             )
         )
     return records
@@ -615,6 +626,341 @@ def _instance_output_path_for_member(path: str) -> str:
     return path
 
 
+def _replace_locale_in_path(path: str, locale: str) -> str:
+    pure_path = PurePosixPath(path)
+    parts = list(pure_path.parts)
+    if "lang" in parts:
+        index = parts.index("lang")
+        if index + 1 < len(parts):
+            suffix = PurePosixPath(parts[index + 1]).suffix
+            parts[index + 1] = f"{locale}{suffix}"
+            return PurePosixPath(*parts).as_posix()
+    return path
+
+
+def _ftbquests_escape_string(text: str) -> str:
+    return text.replace("%", "%%").replace('"', '\\"')
+
+
+def _ftbquests_text_filter(text: str) -> bool:
+    if not text:
+        return False
+    if text.startswith("{") and text.endswith("}"):
+        return False
+    return True
+
+
+def _ftbquests_list_item_path(base_path: tuple[str, ...], item: Any, index: int) -> tuple[str, ...]:
+    if isinstance(item, dict) and "id" in item and isinstance(item["id"], str):
+        return base_path + (f"{base_path[-1]}.{item['id']}",)
+    return base_path + (f"{base_path[-1]}{index}",)
+
+
+def _portability_from_source(source: SourceSpec) -> str:
+    portability = str(source.extra.get("portability", "")).strip()
+    if portability:
+        return portability
+    if source.type == "ftbquests_locale_snbt":
+        return "overwrite_only"
+    if source.type == "ftbquests_legacy_inline":
+        return "portable" if source.extra.get("full_pack_rewrite_root") else "overwrite_only"
+    if source.output_kind == "instance":
+        return "overwrite_only"
+    return "portable"
+
+
+def _record_extra_metadata(source: SourceSpec) -> dict[str, Any]:
+    portability = _portability_from_source(source)
+    metadata: dict[str, Any] = {
+        "portability": portability,
+        "full_pack_supported": portability == "portable",
+    }
+    if source.extra.get("full_pack_output_root"):
+        metadata["full_pack_output_root"] = str(source.extra["full_pack_output_root"])
+    if source.extra.get("full_pack_rewrite_root"):
+        metadata["full_pack_rewrite_root"] = str(source.extra["full_pack_rewrite_root"])
+    return metadata
+
+
+def _metadata_with_source_extra(metadata: dict[str, Any], source: SourceSpec) -> dict[str, Any]:
+    merged = dict(metadata)
+    merged.update(_record_extra_metadata(source))
+    return merged
+
+
+def _ftbquests_record(
+    *,
+    source: SourceSpec,
+    source_id: str,
+    source_origin: str,
+    key: str,
+    source_text: str,
+    metadata: dict[str, Any],
+) -> Record:
+    namespace = source.target_namespace or str(source.extra.get("lang_namespace") or "ftbquests")
+    return Record(
+        namespace=namespace,
+        key=key,
+        source_text=source_text,
+        annotated_text=source_text,
+        source_origin=source_origin,
+        source_id=source_id,
+        content_type=str(metadata["content_type"]),
+        output_kind=source.output_kind,
+        output_path=metadata.get("output_path"),
+        metadata=_metadata_with_source_extra(metadata, source),
+    )
+
+
+def _extract_legacy_ftbquests_records(
+    source: SourceSpec,
+    *,
+    progress: NullProgress | None = None,
+) -> list[Record]:
+    if not source.path:
+        raise ValueError(f"source {source.id} is missing path")
+    quest_root = Path(source.path)
+    namespace = source.target_namespace or str(source.extra.get("lang_namespace") or "ftbquests")
+    lang_output_root = str(source.extra.get("lang_output_root") or source.output_root or "resourcepack")
+    lang_output_path = f"assets/{namespace}/lang/{source.locale or 'ja_jp'}.json"
+    rewritten_output_root = str(source.extra.get("rewritten_output_root") or source.output_root or "config/ftbquests/quests")
+    full_pack_rewrite_root = source.extra.get("full_pack_rewrite_root")
+    records: list[Record] = []
+    snbt_files = sorted(path for path in quest_root.rglob("*.snbt") if "lang" not in path.relative_to(quest_root).parts)
+    for index, file_path in enumerate(snbt_files, start=1):
+        relative_path = file_path.relative_to(quest_root).as_posix()
+        if progress:
+            progress.item("FILE", index, len(snbt_files), relative_path, source.id)
+        payload = parse_snbt(file_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            continue
+        chapter = file_path.stem
+        file_records = _legacy_ftbquests_records_from_payload(
+            source=source,
+            payload=payload,
+            chapter=chapter,
+            relative_path=relative_path,
+            source_origin=str(file_path.resolve()),
+            lang_output_root=lang_output_root,
+            lang_output_path=lang_output_path,
+            rewritten_output_root=rewritten_output_root,
+            full_pack_rewrite_root=str(full_pack_rewrite_root) if full_pack_rewrite_root else None,
+        )
+        records.extend(file_records)
+    return records
+
+
+def _legacy_ftbquests_records_from_payload(
+    *,
+    source: SourceSpec,
+    payload: dict[str, Any],
+    chapter: str,
+    relative_path: str,
+    source_origin: str,
+    lang_output_root: str,
+    lang_output_path: str,
+    rewritten_output_root: str,
+    full_pack_rewrite_root: str | None,
+) -> list[Record]:
+    records: list[Record] = []
+
+    def walk(node: Any, lang_key: str, rewrite_path: list[str]) -> None:
+        if not isinstance(node, dict):
+            return
+        for key in [candidate for candidate in node.keys() if node[candidate]]:
+            value = node[key]
+            if isinstance(value, dict):
+                walk(value, f"{lang_key}.{key}", rewrite_path + [key])
+                continue
+            if isinstance(value, list) and value and all(isinstance(item, dict) for item in value):
+                for index, item in enumerate(value):
+                    nested_key = f"{key}.{item['id']}" if isinstance(item.get("id"), str) else f"{key}{index}"
+                    walk(item, f"{lang_key}.{nested_key}", rewrite_path + [nested_key])
+                continue
+            if key not in FTBQUESTS_TRANSLATABLE_FIELDS:
+                continue
+            records.extend(
+                _legacy_ftbquests_field_records(
+                    source=source,
+                    lang_key=lang_key,
+                    rewrite_path=rewrite_path,
+                    field_name=key,
+                    value=value,
+                    relative_path=relative_path,
+                    source_origin=source_origin,
+                    lang_output_root=lang_output_root,
+                    lang_output_path=lang_output_path,
+                    rewritten_output_root=rewritten_output_root,
+                    full_pack_rewrite_root=full_pack_rewrite_root,
+                )
+            )
+
+    walk(payload, f"{source.target_namespace or source.extra.get('lang_namespace') or 'ftbquests'}.{chapter}", [])
+    return records
+
+
+def _legacy_ftbquests_field_records(
+    *,
+    source: SourceSpec,
+    lang_key: str,
+    rewrite_path: list[str],
+    field_name: str,
+    value: Any,
+    relative_path: str,
+    source_origin: str,
+    lang_output_root: str,
+    lang_output_path: str,
+    rewritten_output_root: str,
+    full_pack_rewrite_root: str | None,
+) -> list[Record]:
+    records: list[Record] = []
+    base_metadata = {
+        "quest_root_type": "ftbquests_legacy_inline",
+        "content_type": "ftbquests_legacy_inline",
+        "quest_file_path": relative_path,
+        "rewritten_output_root": rewritten_output_root,
+        "rewritten_output_path": relative_path,
+        "generated_lang_output_root": lang_output_root,
+        "generated_lang_output_path": lang_output_path,
+        "generated_lang_namespace": source.target_namespace or str(source.extra.get("lang_namespace") or "ftbquests"),
+    }
+    if full_pack_rewrite_root:
+        base_metadata["full_pack_rewrite_root"] = full_pack_rewrite_root
+    if isinstance(value, str) and _ftbquests_text_filter(value):
+        translation_key = f"{lang_key}.{field_name}"
+        metadata = dict(base_metadata)
+        metadata["translation_key"] = translation_key
+        metadata["escape_lang_value"] = True
+        metadata["rewrite_path"] = list(rewrite_path)
+        metadata["rewrite_field"] = field_name
+        records.append(
+            _ftbquests_record(
+                source=source,
+                source_id=source.id,
+                source_origin=source_origin,
+                key=f"{relative_path}::{translation_key}",
+                source_text=_ftbquests_escape_string(value),
+                metadata=metadata,
+            )
+        )
+        return records
+    if not isinstance(value, list):
+        return records
+    translated_index = 0
+    for item in value:
+        if not isinstance(item, str) or not _ftbquests_text_filter(item):
+            continue
+        if item.startswith("[") and item.endswith("]"):
+            parsed_list = ast.literal_eval(item.replace("true", "True").replace("false", "False"))
+            rich_index = 0
+            for rich_item in parsed_list:
+                if rich_item == "":
+                    continue
+                translation_key = f"{lang_key}.{field_name}{translated_index}.rich_text{rich_index}"
+                metadata = dict(base_metadata)
+                metadata["translation_key"] = translation_key
+                metadata["escape_lang_value"] = True
+                metadata["rewrite_path"] = list(rewrite_path)
+                metadata["rewrite_field"] = field_name
+                metadata["rewrite_list_index"] = translated_index
+                metadata["rewrite_rich_index"] = rich_index
+                source_text = rich_item if isinstance(rich_item, str) else str(rich_item.get("text", ""))
+                records.append(
+                    _ftbquests_record(
+                        source=source,
+                        source_id=source.id,
+                        source_origin=source_origin,
+                        key=f"{relative_path}::{translation_key}",
+                        source_text=_ftbquests_escape_string(source_text),
+                        metadata=metadata,
+                    )
+                )
+                rich_index += 1
+        else:
+            translation_key = f"{lang_key}.{field_name}{translated_index}"
+            metadata = dict(base_metadata)
+            metadata["translation_key"] = translation_key
+            metadata["escape_lang_value"] = True
+            metadata["rewrite_path"] = list(rewrite_path)
+            metadata["rewrite_field"] = field_name
+            metadata["rewrite_list_index"] = translated_index
+            records.append(
+                _ftbquests_record(
+                    source=source,
+                    source_id=source.id,
+                    source_origin=source_origin,
+                    key=f"{relative_path}::{translation_key}",
+                    source_text=_ftbquests_escape_string(item),
+                    metadata=metadata,
+                )
+            )
+        translated_index += 1
+    return records
+
+
+def _extract_locale_ftbquests_records(
+    source: SourceSpec,
+    *,
+    progress: NullProgress | None = None,
+) -> list[Record]:
+    if not source.path:
+        raise ValueError(f"source {source.id} is missing path")
+    quest_root = Path(source.path)
+    target_locale = str(source.extra.get("target_locale") or source.locale or "ja_jp")
+    lang_root = quest_root / "lang"
+    locale_files = sorted(lang_root.glob("*.snbt"))
+    records: list[Record] = []
+    for index, file_path in enumerate(locale_files, start=1):
+        relative_path = file_path.relative_to(quest_root).as_posix()
+        if progress:
+            progress.item("FILE", index, len(locale_files), relative_path, source.id)
+        payload = parse_snbt(file_path.read_text(encoding="utf-8"))
+        records.extend(
+            _locale_ftbquests_records_from_payload(
+                source=source,
+                payload=payload,
+                relative_path=relative_path,
+                source_origin=str(file_path.resolve()),
+                target_locale=target_locale,
+            )
+        )
+    return records
+
+
+def _locale_ftbquests_records_from_payload(
+    *,
+    source: SourceSpec,
+    payload: Any,
+    relative_path: str,
+    source_origin: str,
+    target_locale: str,
+) -> list[Record]:
+    records: list[Record] = []
+    if not isinstance(payload, dict):
+        return records
+    target_path = _replace_locale_in_path(relative_path, target_locale)
+    for json_path, value in _json_string_entries(payload):
+        records.append(
+            _ftbquests_record(
+                source=source,
+                source_id=source.id,
+                source_origin=source_origin,
+                key=f"{relative_path}::{_json_path_to_key(json_path)}",
+                source_text=value,
+                metadata={
+                    "content_type": "ftbquests_locale_snbt",
+                    "quest_root_type": "ftbquests_locale_snbt",
+                    "quest_file_path": relative_path,
+                    "output_root": source.output_root or "config/ftbquests/quests",
+                    "output_path": target_path,
+                    "template_payload": payload,
+                    "json_path": list(json_path),
+                },
+            )
+        )
+    return records
+
+
 def _ingest_instance_payload(
     *,
     source: SourceSpec,
@@ -691,6 +1037,10 @@ def _iter_instance_archive_members(archive: zipfile.ZipFile) -> list[str]:
 def _ingest_instance_dir(source: SourceSpec, *, progress: NullProgress | None = None) -> list[Record]:
     if not source.path:
         raise ValueError(f"source {source.id} is missing path")
+    if source.type == "ftbquests_legacy_inline":
+        return _extract_legacy_ftbquests_records(source, progress=progress)
+    if source.type == "ftbquests_locale_snbt":
+        return _extract_locale_ftbquests_records(source, progress=progress)
     root = Path(source.path)
     members = set(_iter_instance_dir_members(root))
     if source.output_kind == "instance":
@@ -898,6 +1248,10 @@ def ingest_sources_with_report(
                 source_records = _ingest_instance_dir(source, progress=reporter)
             elif source.type == "instance_archive":
                 source_records = _ingest_instance_archive(source, progress=reporter)
+            elif source.type == "ftbquests_legacy_inline":
+                source_records = _extract_legacy_ftbquests_records(source, progress=reporter)
+            elif source.type == "ftbquests_locale_snbt":
+                source_records = _extract_locale_ftbquests_records(source, progress=reporter)
             else:
                 raise ValueError(f"unsupported source type: {source.type}")
             records.extend(source_records)
@@ -1299,6 +1653,8 @@ def discover_ftbquests(instance_root: Path) -> dict[str, Any]:
         snbt_files = sorted(path.relative_to(quest_root).as_posix() for path in quest_root.rglob("*.snbt"))
         lang_files = [path for path in snbt_files if path.startswith("lang/")]
         content_files = [path for path in snbt_files if not path.startswith("lang/")]
+        quest_root_type = "ftbquests_locale_snbt" if lang_files else "ftbquests_legacy_inline"
+        portability = "overwrite_only" if quest_root_type == "ftbquests_locale_snbt" else "overwrite_only"
         entries.append(
             {
                 "path": str(quest_root.resolve()),
@@ -1309,6 +1665,11 @@ def discover_ftbquests(instance_root: Path) -> dict[str, Any]:
                 "has_data_snbt": "data.snbt" in snbt_files,
                 "has_chapter_groups_snbt": "chapter_groups.snbt" in snbt_files,
                 "localization_style": "locale_snbt" if lang_files else "inline_or_key_rewritten",
+                "quest_root_type": quest_root_type,
+                "portability": portability,
+                "portable": portability == "portable",
+                "overwrite_output_root": str(quest_root.relative_to(instance_root).as_posix()),
+                "full_pack_output_root": None,
                 "sample_files": snbt_files[:20],
             }
         )
@@ -1429,6 +1790,7 @@ def _instance_source_from_entry(entry: dict[str, Any], *, output_kind: str, outp
         "output_root": output_root,
         "locale": "ja_jp",
         "content_kinds": ["lang_json", "guide_text", "patchouli_json", "patchouli_text"],
+        "portability": "portable" if output_kind != "instance" else "overwrite_only",
     }
 
 
@@ -1476,6 +1838,7 @@ def build_instance_manifest(
         instance_root / "resourcepacks",
         source_prefix="resourcepack",
     )
+    ftbquests = discover_ftbquests(instance_root)
     sources: list[dict[str, Any]] = []
     if include_vanilla:
         sources.append(
@@ -1508,6 +1871,55 @@ def build_instance_manifest(
             output_root_factory=lambda entry: "resourcepack",
         )
     )
+    quest_pack_entry = next(
+        (
+            entry
+            for entry in openloader_resources.get("entries", [])
+            if "quest" in str(entry.get("entry_name", "")).lower() or "quest" in str(entry.get("pack_id", "")).lower()
+        ),
+        None,
+    )
+    quest_pack_root = (
+        f"config/openloader/resources/{quest_pack_entry.get('pack_id') or quest_pack_entry.get('entry_name')}"
+        if quest_pack_entry
+        else "config/openloader/resources/quests"
+    )
+    quest_namespace = None
+    if quest_pack_entry and quest_pack_entry.get("all_lang_namespaces"):
+        quest_namespace = list(quest_pack_entry["all_lang_namespaces"])[0]
+    for entry in ftbquests.get("entries", []):
+        if entry.get("quest_root_type") == "ftbquests_legacy_inline":
+            sources.append(
+                {
+                    "id": f"ftbquests:{Path(entry['path']).name}",
+                    "type": "ftbquests_legacy_inline",
+                    "path": entry["path"],
+                    "target_namespace": quest_namespace or "ftbquests",
+                    "locale": locale,
+                    "output_kind": "instance",
+                    "output_root": entry["overwrite_output_root"],
+                    "rewritten_output_root": entry["overwrite_output_root"],
+                    "lang_output_root": quest_pack_root,
+                    "content_kinds": ["ftbquests_legacy_inline", "ftbquests_generated_lang_json"],
+                    "portability": entry.get("portability", "overwrite_only"),
+                    "quest_root_type": entry.get("quest_root_type"),
+                }
+            )
+        else:
+            sources.append(
+                {
+                    "id": f"ftbquests:{Path(entry['path']).name}:lang",
+                    "type": "ftbquests_locale_snbt",
+                    "path": entry["path"],
+                    "locale": locale,
+                    "target_locale": locale,
+                    "output_kind": "instance",
+                    "output_root": entry["overwrite_output_root"],
+                    "content_kinds": ["ftbquests_locale_snbt"],
+                    "portability": entry.get("portability", "overwrite_only"),
+                    "quest_root_type": entry.get("quest_root_type"),
+                }
+            )
     patchouli_external = discover_patchouli_external_books(instance_root)
     for entry in patchouli_external.get("entries", []):
         sources.append(
@@ -1519,6 +1931,7 @@ def build_instance_manifest(
                 "output_root": f"patchouli_books/{entry['book_name']}",
                 "locale": locale,
                 "content_kinds": ["patchouli_json", "patchouli_text"],
+                "portability": "overwrite_only",
             }
         )
     return {
@@ -1536,6 +1949,7 @@ def build_instance_manifest(
             "mods": mods,
             "openloader_resources": openloader_resources,
             "resourcepacks": resourcepacks,
+            "ftbquests": ftbquests,
             "patchouli_external_books": patchouli_external,
         },
         "sources": sources,
@@ -1562,7 +1976,7 @@ def build_instance_content_report(
     mods = manifest["discovery"]["mods"]
     openloader_resources = manifest["discovery"]["openloader_resources"]
     resourcepacks = manifest["discovery"]["resourcepacks"]
-    ftbquests = discover_ftbquests(instance_root)
+    ftbquests = manifest["discovery"]["ftbquests"]
     patchouli_external = discover_patchouli_external_books(instance_root)
     guide_sources = (
         _guide_entries("mods", list(mods.get("entries", [])))
@@ -1587,6 +2001,17 @@ def build_instance_content_report(
             }
         )
 
+    portability_report = [
+        {
+            "source_id": source.get("id"),
+            "type": source.get("type"),
+            "portability": source.get("portability", "portable"),
+            "overwrite_destination": source.get("output_root"),
+            "full_pack_destination": source.get("full_pack_output_root") or source.get("output_root") if source.get("portability") == "portable" else None,
+        }
+        for source in manifest["sources"]
+    ]
+
     return {
         "instance_root": str(instance_root.resolve()),
         "source_count": len(manifest["sources"]),
@@ -1599,6 +2024,7 @@ def build_instance_content_report(
         "patchouli_external_books": patchouli_external,
         "guide_sources": guide_sources,
         "patchouli_sources": patchouli_sources,
+        "portability_report": portability_report,
         "override_rules": _instance_override_rules(),
     }
 

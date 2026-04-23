@@ -21,6 +21,7 @@ class SourceSpec:
     output_kind: str = "resourcepack"
     output_root: str | None = None
     content_kinds: list[str] = field(default_factory=list)
+    extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], defaults: dict[str, Any]) -> "SourceSpec":
@@ -41,6 +42,28 @@ class SourceSpec:
             output_kind=data.get("output_kind", "resourcepack"),
             output_root=data.get("output_root"),
             content_kinds=list(data.get("content_kinds") or []),
+            extra={
+                key: value
+                for key, value in data.items()
+                if key
+                not in {
+                    "id",
+                    "type",
+                    "owner",
+                    "repo",
+                    "ref",
+                    "path",
+                    "include_globs",
+                    "target_namespace",
+                    "json_mode",
+                    "enabled",
+                    "minecraft_version",
+                    "locale",
+                    "output_kind",
+                    "output_root",
+                    "content_kinds",
+                }
+            },
         )
 
 

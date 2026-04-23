@@ -556,3 +556,195 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(summary["review_candidate_count"], 2)
             self.assertEqual(summary["review_category_counts"]["compound_or_lexical_conflict"], 1)
             self.assertEqual(summary["review_category_counts"]["unresolved_counter_or_numeric_conflict"], 1)
+
+    def test_legacy_ftbquests_builds_rewritten_snbt_and_lang_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            quest_root = tmp_path / "config" / "ftbquests" / "quests"
+            chapter_path = quest_root / "chapters" / "test.snbt"
+            chapter_path.parent.mkdir(parents=True, exist_ok=True)
+            chapter_path.write_text(
+                "\n".join(
+                    [
+                        "{",
+                        '\tquests: [',
+                        "\t\t{",
+                        '\t\t\tid: "quest_a"',
+                        '\t\t\ttitle: "高電圧機械"',
+                        '\t\t\tsubtitle: "遠心分離機"',
+                        '\t\t\tdescription: [',
+                        '\t\t\t\t"高電圧機械"',
+                        '\t\t\t\t"[\'\', \'遠心分離機\']"',
+                        "\t\t\t]",
+                        "\t\t}",
+                        "\t]",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            _write_json(tmp_path / "review" / "glossary.json", {"terms": []})
+            _write_json(
+                tmp_path / "review" / "suggestions.json",
+                {
+                    "gto:chapters/test.snbt::gto.test.quests.quest_a.title": {
+                        "annotated_text": "§^高電圧(こうでんあつ)§^機械(きかい)"
+                    },
+                    "gto:chapters/test.snbt::gto.test.quests.quest_a.subtitle": {
+                        "annotated_text": "§^遠心分離機(えんしんぶんりき)"
+                    },
+                    "gto:chapters/test.snbt::gto.test.quests.quest_a.description0": {
+                        "annotated_text": "§^高電圧(こうでんあつ)§^機械(きかい)"
+                    },
+                    "gto:chapters/test.snbt::gto.test.quests.quest_a.description1.rich_text0": {
+                        "annotated_text": "§^遠心分離機(えんしんぶんりき)"
+                    },
+                },
+            )
+            _write_json(tmp_path / "review" / "review_entries.json", {})
+            _write_json(
+                tmp_path / "manifest.json",
+                {
+                    "pack": {"description": "test pack", "pack_format": 34},
+                    "build": {
+                        "include_generated_by_default": True,
+                        "include_pending_by_default": False,
+                        "target_layout": "instance",
+                    },
+                    "sources": [
+                        {
+                            "id": "ftbquests:quests",
+                            "type": "ftbquests_legacy_inline",
+                            "path": str(quest_root),
+                            "target_namespace": "gto",
+                            "locale": "ja_jp",
+                            "output_kind": "instance",
+                            "output_root": "config/ftbquests/quests",
+                            "rewritten_output_root": "config/ftbquests/quests",
+                            "lang_output_root": "config/openloader/resources/gto_quests",
+                            "full_pack_rewrite_root": "assets/ftbquests",
+                            "portability": "portable",
+                        }
+                    ],
+                },
+            )
+
+            summary = run(tmp_path / "manifest.json", tmp_path, include_generated=True, include_pending=False)
+
+            lang_payload = json.loads(
+                (
+                    tmp_path
+                    / "build"
+                    / "staged"
+                    / "config"
+                    / "openloader"
+                    / "resources"
+                    / "gto_quests"
+                    / "assets"
+                    / "gto"
+                    / "lang"
+                    / "ja_jp.json"
+                ).read_text(encoding="utf-8")
+            )
+            rewritten_snbt = (
+                tmp_path / "build" / "staged" / "config" / "ftbquests" / "quests" / "chapters" / "test.snbt"
+            ).read_text(encoding="utf-8")
+
+            self.assertEqual(summary["build"]["export_mode"], "overwrite")
+            self.assertEqual(lang_payload["gto.test.quests.quest_a.title"], "§^高電圧(こうでんあつ)§^機械(きかい)")
+            self.assertEqual(
+                lang_payload["gto.test.quests.quest_a.description1.rich_text0"],
+                "§^遠心分離機(えんしんぶんりき)",
+            )
+            self.assertIn('{gto.test.quests.quest_a.title}', rewritten_snbt)
+
+            full_pack = build(
+                tmp_path / "manifest.json",
+                tmp_path,
+                include_generated=True,
+                include_pending=False,
+                export_mode="full-pack",
+                export_locale="ja_rubi",
+            )
+            full_pack_lang = json.loads(
+                (tmp_path / "build" / "resourcepack" / "assets" / "gto" / "lang" / "ja_rubi.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            full_pack_snbt = (
+                tmp_path / "build" / "resourcepack" / "assets" / "ftbquests" / "chapters" / "test.snbt"
+            ).read_text(encoding="utf-8")
+            pack_meta = json.loads((tmp_path / "build" / "resourcepack" / "pack.mcmeta").read_text(encoding="utf-8"))
+
+            self.assertEqual(full_pack["export_locale"], "ja_rubi")
+            self.assertIn("ja_rubi", pack_meta["language"])
+            self.assertEqual(full_pack_lang["gto.test.quests.quest_a.subtitle"], "§^遠心分離機(えんしんぶんりき)")
+            self.assertIn('{gto.test.quests.quest_a.description0}', full_pack_snbt)
+
+    def test_ftbquests_locale_snbt_overwrite_and_full_pack_block(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            quest_root = tmp_path / "config" / "ftbquests" / "quests"
+            locale_path = quest_root / "lang" / "ja_jp.snbt"
+            locale_path.parent.mkdir(parents=True, exist_ok=True)
+            locale_path.write_text(
+                "\n".join(
+                    [
+                        "{",
+                        '\tchapter: {',
+                        '\t\tquest: "高電圧機械"',
+                        "\t}",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            _write_json(tmp_path / "review" / "glossary.json", {"terms": []})
+            _write_json(
+                tmp_path / "review" / "suggestions.json",
+                {
+                    "ftbquests:lang/ja_jp.snbt::chapter.quest": {
+                        "annotated_text": "§^高電圧(こうでんあつ)§^機械(きかい)"
+                    }
+                },
+            )
+            _write_json(tmp_path / "review" / "review_entries.json", {})
+            _write_json(
+                tmp_path / "manifest.json",
+                {
+                    "pack": {"description": "test pack", "pack_format": 34},
+                    "build": {
+                        "include_generated_by_default": True,
+                        "include_pending_by_default": False,
+                        "target_layout": "instance",
+                    },
+                    "sources": [
+                        {
+                            "id": "ftbquests:lang",
+                            "type": "ftbquests_locale_snbt",
+                            "path": str(quest_root),
+                            "locale": "ja_jp",
+                            "target_locale": "ja_rubi",
+                            "output_kind": "instance",
+                            "output_root": "config/ftbquests/quests",
+                            "portability": "overwrite_only",
+                        }
+                    ],
+                },
+            )
+
+            run(tmp_path / "manifest.json", tmp_path, include_generated=True, include_pending=False)
+            staged_snbt = (
+                tmp_path / "build" / "staged" / "config" / "ftbquests" / "quests" / "lang" / "ja_rubi.snbt"
+            ).read_text(encoding="utf-8")
+            self.assertIn("§^高電圧(こうでんあつ)§^機械(きかい)", staged_snbt)
+
+            with self.assertRaisesRegex(ValueError, "overwrite-only sources"):
+                build(
+                    tmp_path / "manifest.json",
+                    tmp_path,
+                    include_generated=True,
+                    include_pending=False,
+                    export_mode="full-pack",
+                    export_locale="ja_rubi",
+                )

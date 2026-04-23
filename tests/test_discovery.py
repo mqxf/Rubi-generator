@@ -287,8 +287,9 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual(report["patchouli_external_books"]["book_count"], 1)
             self.assertEqual(len(report["guide_sources"]), 1)
             self.assertEqual(report["manifest"]["sources"][0]["type"], "minecraft_assets")
-            self.assertEqual(len(report["manifest"]["sources"]), 5)
-            self.assertEqual(report["source_count"], 5)
+            self.assertEqual(len(report["manifest"]["sources"]), 6)
+            self.assertEqual(report["source_count"], 6)
+            self.assertTrue(any(source["type"] == "ftbquests_legacy_inline" for source in report["manifest"]["sources"]))
 
     def test_builds_instance_manifest_with_staged_targets(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

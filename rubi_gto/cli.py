@@ -36,6 +36,8 @@ def _parser() -> argparse.ArgumentParser:
             pending_group = command.add_mutually_exclusive_group()
             pending_group.add_argument("--include-pending", dest="include_pending", action="store_true", default=None)
             pending_group.add_argument("--exclude-pending", dest="include_pending", action="store_false")
+            command.add_argument("--export-mode", choices=["overwrite", "full-pack"], default=None)
+            command.add_argument("--export-locale", default=None)
 
     for name in ("annotate", "report"):
         command = subparsers.add_parser(name)
@@ -101,6 +103,8 @@ def _parser() -> argparse.ArgumentParser:
     pending_group = run_instance.add_mutually_exclusive_group()
     pending_group.add_argument("--include-pending", dest="include_pending", action="store_true", default=None)
     pending_group.add_argument("--exclude-pending", dest="include_pending", action="store_false")
+    run_instance.add_argument("--export-mode", choices=["overwrite", "full-pack"], default="overwrite")
+    run_instance.add_argument("--export-locale", default="ja_rubi")
 
     return parser
 
@@ -140,6 +144,8 @@ def main(argv: list[str] | None = None) -> int:
             workspace,
             include_generated=args.include_generated,
             include_pending=args.include_pending,
+            export_mode=args.export_mode,
+            export_locale=args.export_locale,
             progress=progress,
         )
     elif args.command == "discover-local":
@@ -208,6 +214,9 @@ def main(argv: list[str] | None = None) -> int:
             minecraft_version=args.minecraft_version,
             locale=args.locale,
         )
+        runtime_manifest.setdefault("build", {})
+        runtime_manifest["build"]["export_mode"] = args.export_mode
+        runtime_manifest["build"]["export_locale"] = args.export_locale
         runtime_manifest_path = workspace / "build" / "reports" / "instance_runtime_manifest.json"
         runtime_manifest_path.parent.mkdir(parents=True, exist_ok=True)
         runtime_manifest_path.write_text(
@@ -219,6 +228,8 @@ def main(argv: list[str] | None = None) -> int:
             workspace,
             include_generated=args.include_generated,
             include_pending=args.include_pending,
+            export_mode=args.export_mode,
+            export_locale=args.export_locale,
             progress=progress,
             source_ids=args.source_ids,
             failed_only=args.failed_only,
@@ -229,6 +240,8 @@ def main(argv: list[str] | None = None) -> int:
             workspace,
             include_generated=args.include_generated,
             include_pending=args.include_pending,
+            export_mode=args.export_mode,
+            export_locale=args.export_locale,
             progress=progress,
             source_ids=args.source_ids,
             failed_only=args.failed_only,

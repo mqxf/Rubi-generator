@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from collections import defaultdict
 import copy
 from pathlib import Path
@@ -11,6 +12,8 @@ from .io_utils import ensure_dir, read_json, read_text, write_json, write_text
 from .japanese import ConsensusAnnotator, categorize_review_candidate
 from .models import Record
 from .progress import NullProgress
+from .snbt import dump as dump_snbt
+from .snbt import parse as parse_snbt
 from .sources import (
     ingest_sources_with_report,
     load_manifest,
@@ -289,6 +292,16 @@ def _build_target_layout(manifest_path: Path) -> str:
     return str(manifest.get("build", {}).get("target_layout", "resourcepack"))
 
 
+def _build_export_mode(manifest_path: Path) -> str:
+    manifest, _ = load_manifest(manifest_path)
+    return str(manifest.get("build", {}).get("export_mode", "overwrite"))
+
+
+def _build_export_locale(manifest_path: Path) -> str:
+    manifest, _ = load_manifest(manifest_path)
+    return str(manifest.get("build", {}).get("export_locale", "ja_rubi"))
+
+
 def _set_nested_value(payload: Any, path: list[str], value: str) -> None:
     current = payload
     for part in path[:-1]:
@@ -315,6 +328,113 @@ def _write_pack_meta(path: Path, *, description: str, pack_format: int, pack_id:
     write_json(path / "pack.mcmeta", payload)
 
 
+def _write_pack_meta_with_language(
+    path: Path,
+    *,
+    description: str,
+    pack_format: int,
+    locale: str,
+    pack_id: str | None = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "pack": {
+            "description": description,
+            "pack_format": pack_format,
+        },
+        "language": {
+            locale: {
+                "name": locale,
+                "region": "Generated",
+                "bidirectional": False,
+            }
+        },
+    }
+    if pack_id:
+        payload["id"] = pack_id
+    write_json(path / "pack.mcmeta", payload)
+
+
+def _replace_locale_in_output_path(path: str, locale: str) -> str:
+    parts = list(Path(path).parts)
+    if "lang" in parts:
+        index = parts.index("lang")
+        if index + 1 < len(parts):
+            suffix = Path(parts[index + 1]).suffix
+            parts[index + 1] = f"{locale}{suffix}"
+            return Path(*parts).as_posix()
+    return path
+
+
+def _rewrite_legacy_ftbquests_payload(payload: Any, record: Record) -> None:
+    current = payload
+    for part in list(record.metadata.get("rewrite_path", [])):
+        if not isinstance(current, dict):
+            return
+        if "." in part:
+            list_name, object_id = part.split(".", 1)
+            candidates = current.get(list_name, [])
+            if not isinstance(candidates, list):
+                return
+            current = next(
+                (
+                    item
+                    for item in candidates
+                    if isinstance(item, dict) and str(item.get("id")) == object_id
+                ),
+                None,
+            )
+        else:
+            current = current.get(part)
+        if current is None:
+            return
+    _rewrite_legacy_ftbquests_value(current, record)
+
+
+def _rewrite_legacy_ftbquests_value(node: Any, record: Record) -> bool:
+    if not isinstance(node, dict):
+        return False
+    field_name = str(record.metadata["rewrite_field"])
+    translation_key = str(record.metadata["translation_key"])
+    value = node.get(field_name)
+    if isinstance(value, str):
+        node[field_name] = "{" + translation_key + "}"
+        return True
+    if not isinstance(value, list):
+        return False
+    target_list_index = record.metadata.get("rewrite_list_index")
+    target_rich_index = record.metadata.get("rewrite_rich_index")
+    translated_index = 0
+    for item_index, item in enumerate(value):
+        if not isinstance(item, str):
+            continue
+        if not item or (item.startswith("{") and item.endswith("}")):
+            continue
+        if translated_index != target_list_index:
+            translated_index += 1
+            continue
+        if target_rich_index is None:
+            node[field_name][item_index] = "{" + translation_key + "}"
+            return True
+        rich_payload = ast.literal_eval(item.replace("true", "True").replace("false", "False"))
+        translated_rich_index = 0
+        for rich_item_index, rich_item in enumerate(rich_payload):
+            if rich_item == "":
+                continue
+            if translated_rich_index != target_rich_index:
+                translated_rich_index += 1
+                continue
+            if isinstance(rich_item, str):
+                rich_payload[rich_item_index] = {"translate": translation_key}
+            else:
+                rich_payload[rich_item_index].pop("text", None)
+                rich_payload[rich_item_index]["translate"] = translation_key
+            if rich_payload and rich_payload[0] != "":
+                rich_payload = [""] + rich_payload
+            node[field_name][item_index] = json.dumps(rich_payload, ensure_ascii=False)
+            return True
+    return False
+
+
 def resolve_include_generated(manifest_path: Path, include_generated: bool | None) -> bool:
     if include_generated is not None:
         return include_generated
@@ -335,6 +455,8 @@ def build(
     *,
     include_generated: bool | None = None,
     include_pending: bool | None = None,
+    export_mode: str | None = None,
+    export_locale: str | None = None,
     progress: NullProgress | None = None,
 ) -> dict[str, Any]:
     annotated_path = workspace / ANNOTATED_PATH
@@ -346,8 +468,36 @@ def build(
     resolved_include_generated = resolve_include_generated(manifest_path, include_generated)
     resolved_include_pending = resolve_include_pending(manifest_path, include_pending)
     target_layout = _build_target_layout(manifest_path)
+    resolved_export_mode = export_mode or _build_export_mode(manifest_path)
+    resolved_export_locale = export_locale or _build_export_locale(manifest_path)
+    manifest_payload, _ = load_manifest(manifest_path)
+    source_portability = [
+        {
+            "source_id": source.get("id"),
+            "type": source.get("type"),
+            "portability": source.get("portability", "portable"),
+            "overwrite_destination": source.get("output_root"),
+            "full_pack_destination": source.get("full_pack_output_root") or "resourcepack"
+            if source.get("portability", "portable") == "portable"
+            else None,
+        }
+        for source in manifest_payload.get("sources", [])
+    ]
+    full_pack_blockers = [
+        item
+        for item in source_portability
+        if resolved_export_mode == "full-pack" and item["portability"] != "portable"
+    ]
+    if full_pack_blockers:
+        raise ValueError(
+            "full-pack export is blocked by overwrite-only sources: "
+            + ", ".join(f"{item['source_id']} ({item['type']})" for item in full_pack_blockers)
+        )
 
-    output_root = workspace / (STAGED_INSTANCE_PATH if target_layout == "instance" else RESOURCEPACK_PATH)
+    output_root = workspace / (
+        RESOURCEPACK_PATH if resolved_export_mode == "full-pack" or target_layout != "instance" else STAGED_INSTANCE_PATH
+    )
+    instance_like = target_layout == "instance" and resolved_export_mode == "overwrite"
     if output_root.exists():
         shutil.rmtree(output_root)
     ensure_dir(output_root)
@@ -358,7 +508,7 @@ def build(
     if resolved_include_pending:
         allowed_statuses.add("pending")
 
-    if target_layout == "instance":
+    if instance_like:
         manifest_pack = _pack_meta(manifest_path)["pack"]
         resourcepack_root = output_root / "resourcepack"
         ensure_dir(resourcepack_root)
@@ -368,21 +518,53 @@ def build(
             pack_format=int(manifest_pack["pack_format"]),
         )
     else:
-        write_json(output_root / "pack.mcmeta", _pack_meta(manifest_path))
+        manifest_pack = _pack_meta(manifest_path)["pack"]
+        if resolved_export_mode == "full-pack":
+            _write_pack_meta_with_language(
+                output_root,
+                description=str(manifest_pack["description"]),
+                pack_format=int(manifest_pack["pack_format"]),
+                locale=resolved_export_locale,
+            )
+        else:
+            write_json(output_root / "pack.mcmeta", _pack_meta(manifest_path))
 
     grouped: dict[str, dict[str, str]] = defaultdict(dict)
+    grouped_lang_files: dict[tuple[str, str], dict[str, str]] = defaultdict(dict)
     grouped_json: dict[tuple[str, str], dict[str, Any]] = {}
+    grouped_snbt: dict[tuple[str, str], Any] = {}
     grouped_text: dict[tuple[str, str], str] = {}
     for record in records:
         if record.review_status not in allowed_statuses:
             continue
-        if target_layout != "instance":
+        if not instance_like and record.content_type == "lang_json":
             grouped[record.namespace][record.key] = record.annotated_text
             continue
         output_path = record.output_path or f"assets/{record.namespace}/lang/ja_jp.json"
-        output_root_key = str(record.metadata.get("output_root", "resourcepack"))
+        output_root_key = "resourcepack" if resolved_export_mode == "full-pack" else str(record.metadata.get("output_root", "resourcepack"))
+        if resolved_export_mode == "full-pack" and record.content_type == "lang_json":
+            output_path = _replace_locale_in_output_path(output_path, resolved_export_locale)
         if record.content_type == "lang_json":
-            grouped[f"{output_root_key}:{output_path}"][record.key] = record.annotated_text
+            grouped_lang_files[(output_root_key, output_path)][record.key] = record.annotated_text
+        elif record.content_type == "ftbquests_legacy_inline":
+            lang_output_root = "resourcepack" if resolved_export_mode == "full-pack" else str(
+                record.metadata.get("generated_lang_output_root", output_root_key)
+            )
+            lang_output_path = str(record.metadata.get("generated_lang_output_path", output_path))
+            if resolved_export_mode == "full-pack":
+                lang_output_path = _replace_locale_in_output_path(lang_output_path, resolved_export_locale)
+            grouped_lang_files[(lang_output_root, lang_output_path)][str(record.metadata["translation_key"])] = record.annotated_text
+            rewritten_root = str(record.metadata.get("rewritten_output_root", output_root_key))
+            rewritten_path = str(record.metadata.get("rewritten_output_path", output_path))
+            if resolved_export_mode == "full-pack":
+                rewritten_root = str(record.metadata.get("full_pack_rewrite_root") or "resourcepack")
+            key = (rewritten_root, rewritten_path)
+            template = grouped_snbt.get(key)
+            if template is None:
+                source_file = Path(str(record.source_origin).split(":", 1)[0])
+                template = parse_snbt(source_file.read_text(encoding="utf-8"))
+                grouped_snbt[key] = template
+            _rewrite_legacy_ftbquests_payload(template, record)
         elif record.content_type in {"patchouli_json", "json_strings"}:
             key = (output_root_key, output_path)
             if key not in grouped_json:
@@ -390,24 +572,55 @@ def build(
             json_path = list(record.metadata.get("json_path", []))
             if json_path:
                 _set_nested_value(grouped_json[key], json_path, record.annotated_text)
+        elif record.content_type == "ftbquests_locale_snbt":
+            key = (
+                output_root_key,
+                _replace_locale_in_output_path(output_path, resolved_export_locale) if resolved_export_mode == "full-pack" else output_path,
+            )
+            if key not in grouped_snbt:
+                grouped_snbt[key] = copy.deepcopy(record.metadata.get("template_payload", {}))
+            json_path = list(record.metadata.get("json_path", []))
+            if json_path:
+                _set_nested_value(grouped_snbt[key], json_path, record.annotated_text)
         else:
             grouped_text[(output_root_key, output_path)] = record.annotated_text
 
     written_files: list[str] = []
     written_output_kinds: dict[str, int] = defaultdict(int)
-    if target_layout != "instance":
+    if not instance_like:
         for index, (namespace, mapping) in enumerate(sorted(grouped.items()), start=1):
             reporter.item("NAMESPACE", index, len(grouped), namespace, f"entries={len(mapping)}")
-            path = output_root / "assets" / namespace / "lang" / "ja_jp.json"
+            locale = resolved_export_locale if resolved_export_mode == "full-pack" else "ja_jp"
+            path = output_root / "assets" / namespace / "lang" / f"{locale}.json"
             write_json(path, mapping)
             written_files.append(str(path.relative_to(workspace)))
+        total_extra_files = len(grouped_lang_files) + len(grouped_json) + len(grouped_snbt) + len(grouped_text)
+        for (output_root_key, output_path), payload in sorted(grouped_lang_files.items()):
+            reporter.item("FILE", len(written_files) + 1, total_extra_files, output_path, output_root_key)
+            target_path = output_root / output_path if output_root_key == "resourcepack" else output_root / output_root_key / output_path
+            write_json(target_path, payload)
+            written_files.append(str(target_path.relative_to(workspace)))
+        for (output_root_key, output_path), payload in sorted(grouped_json.items()):
+            reporter.item("FILE", len(written_files) + 1, total_extra_files, output_path, output_root_key)
+            target_path = output_root / output_path if output_root_key == "resourcepack" else output_root / output_root_key / output_path
+            write_json(target_path, payload)
+            written_files.append(str(target_path.relative_to(workspace)))
+        for (output_root_key, output_path), payload in sorted(grouped_snbt.items()):
+            reporter.item("FILE", len(written_files) + 1, total_extra_files, output_path, output_root_key)
+            target_path = output_root / output_path if output_root_key == "resourcepack" else output_root / output_root_key / output_path
+            write_text(target_path, dump_snbt(payload) + "\n")
+            written_files.append(str(target_path.relative_to(workspace)))
+        for (output_root_key, output_path), text in sorted(grouped_text.items()):
+            reporter.item("FILE", len(written_files) + 1, total_extra_files, output_path, output_root_key)
+            target_path = output_root / output_path if output_root_key == "resourcepack" else output_root / output_root_key / output_path
+            write_text(target_path, text)
+            written_files.append(str(target_path.relative_to(workspace)))
     else:
         openloader_roots: set[str] = set()
-        total_files = len(grouped) + len(grouped_json) + len(grouped_text)
+        total_files = len(grouped_lang_files) + len(grouped_json) + len(grouped_snbt) + len(grouped_text)
         write_index = 0
-        for compound_key, mapping in sorted(grouped.items()):
+        for (output_root_key, output_path), mapping in sorted(grouped_lang_files.items()):
             write_index += 1
-            output_root_key, output_path = compound_key.split(":", 1)
             reporter.item("FILE", write_index, total_files, output_path, output_root_key)
             target_path = output_root / output_root_key / output_path
             write_json(target_path, mapping)
@@ -424,6 +637,15 @@ def build(
             written_output_kinds[output_root_key] += 1
             if output_root_key.startswith("config/openloader/resources/"):
                 openloader_roots.add(output_root_key)
+        for (output_root_key, output_path), payload in sorted(grouped_snbt.items()):
+            write_index += 1
+            reporter.item("FILE", write_index, total_files, output_path, output_root_key)
+            target_path = output_root / output_root_key / output_path
+            write_text(target_path, dump_snbt(payload) + "\n")
+            written_files.append(str(target_path.relative_to(workspace)))
+            written_output_kinds[output_root_key] += 1
+            if output_root_key.startswith("config/openloader/resources/"):
+                openloader_roots.add(output_root_key)
         for (output_root_key, output_path), text in sorted(grouped_text.items()):
             write_index += 1
             reporter.item("FILE", write_index, total_files, output_path, output_root_key)
@@ -436,6 +658,8 @@ def build(
         for openloader_root in sorted(openloader_roots):
             target_root = output_root / openloader_root
             if not (target_root / "pack.mcmeta").exists():
+                if resolved_export_mode == "full-pack":
+                    continue
                 _write_pack_meta(
                     target_root,
                     description=f"Rubi GTO generated override for {Path(openloader_root).name}",
@@ -444,7 +668,7 @@ def build(
                 )
 
     build_summary = {
-        "namespace_count": len(grouped) if target_layout != "instance" else len(
+        "namespace_count": len(grouped) if not instance_like else len(
             {
                 record.namespace
                 for record in records
@@ -455,7 +679,11 @@ def build(
         "include_generated": resolved_include_generated,
         "include_pending": resolved_include_pending,
         "target_layout": target_layout,
+        "export_mode": resolved_export_mode,
+        "export_locale": resolved_export_locale,
         "written_output_kinds": dict(sorted(written_output_kinds.items())),
+        "portability_report": source_portability,
+        "full_pack_blockers": full_pack_blockers,
     }
     write_json(workspace / "build" / "reports" / "build_report.json", build_summary)
     reporter.done("Build", f"namespaces={len(grouped)} files={len(written_files)}")
@@ -468,6 +696,8 @@ def run(
     *,
     include_generated: bool | None = None,
     include_pending: bool | None = None,
+    export_mode: str | None = None,
+    export_locale: str | None = None,
     progress: NullProgress | None = None,
     source_ids: list[str] | None = None,
     failed_only: bool = False,
@@ -488,6 +718,8 @@ def run(
         workspace,
         include_generated=include_generated,
         include_pending=include_pending,
+        export_mode=export_mode,
+        export_locale=export_locale,
         progress=reporter,
     )
     summary = {
