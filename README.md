@@ -28,6 +28,9 @@ The pipeline is intentionally conservative:
 
 Short command reference: [WORKFLOW.md](/home/mqxf/Desktop/Coding/Minecraft/rubi-gto/WORKFLOW.md)
 
+The CLI now prints live stage progress to the terminal for ingest, annotate, report, build, run, and LLM review.
+Ingest failures are recorded per source in `build/reports/source_report.json` under `failed_sources` and `failed_source_ids`.
+
 Run the full pipeline:
 
 ```bash
@@ -70,6 +73,13 @@ python3 -m rubi_gto report --workspace .
 python3 -m rubi_gto build --manifest manifests/gto_sources.json --workspace .
 ```
 
+Rerun only one source or rerun only the sources that failed last time:
+
+```bash
+python3 -m rubi_gto run --manifest manifests/gto_sources.json --workspace . --source-id GregTech-Modern
+python3 -m rubi_gto run --manifest manifests/gto_sources.json --workspace . --failed-only
+```
+
 Run the LLM suggestion pass on the remaining review queue:
 
 ```bash
@@ -94,9 +104,74 @@ Default LLM model: `gpt-4.1-mini`
 Discover local upstream repos and emit a manifest you can run in one pass:
 
 ```bash
-python3 -m rubi_gto discover-local --search-root .. --output manifests/gto_local_sources.json
-python3 -m rubi_gto run --manifest manifests/gto_local_sources.json --workspace .
+python3 -m rubi_gto discover-local --search-root ../gto_repos --output build/reports/gto_local_sources.json
+python3 -m rubi_gto run --manifest build/reports/gto_local_sources.json --workspace .
 ```
+
+Append a mods-folder archive source at the same time:
+
+```bash
+python3 -m rubi_gto discover-local \
+  --search-root ../gto_repos \
+  --mods-dir ../gto_repos/GregTech-Odyssey/mods \
+  --output build/reports/gto_all_sources.json
+```
+
+Include vanilla in the generated manifest:
+
+```bash
+python3 -m rubi_gto discover-local --search-root ../gto_repos --include-vanilla --output build/reports/gto_local_plus_vanilla.json
+python3 -m rubi_gto run --manifest build/reports/gto_local_plus_vanilla.json --workspace .
+```
+
+Append manually curated extra sources for mods you cloned later or want to fetch from GitHub:
+
+```bash
+python3 -m rubi_gto discover-local \
+  --search-root ../gto_repos \
+  --append-manifest manifests/upstream_sources.example.json \
+  --output build/reports/gto_full_sources.json
+```
+
+Inspect the packwiz modlist and produce a shortlist of mods that still need an upstream repo:
+
+```bash
+python3 -m rubi_gto discover-packwiz \
+  --pack-root ../gto_repos/GregTech-Odyssey \
+  --search-root ../gto_repos \
+  --output build/reports/gto_packwiz_translation_report.json
+```
+
+`build/reports/gto_packwiz_translation_report.json` includes `upstream_lookup_candidates` with search terms and ready-to-edit source stubs for each unresolved mod.
+
+Build a runnable manifest directly from a `mods/` folder full of `.jar` and `.zip` files. Archives without `assets/*/lang/ja_jp.json` are ignored:
+
+```bash
+python3 -m rubi_gto discover-mod-archives \
+  --mods-dir ../gto_repos/GregTech-Odyssey/mods \
+  --output build/reports/gto_mod_archives.json
+python3 -m rubi_gto run --manifest build/reports/gto_mod_archives.json --workspace .
+```
+
+Scan a whole Minecraft instance folder and emit:
+
+- a content report for mod jars, OpenLoader packs, FTB Quests roots, GuideME pages, and Patchouli books
+- a runnable manifest for every `ja_jp` source found in that instance
+
+```bash
+python3 -m rubi_gto discover-instance \
+  --instance-root ../gto_repos/GregTech-Odyssey \
+  --output build/reports/instance_content_report.json \
+  --manifest-output build/reports/instance_sources.json
+```
+
+The instance report includes override targets for:
+
+- OpenLoader resource packs
+- FTB Quests 1.20 key-based lang files
+- FTB Quests 1.21 `lang/<locale>.snbt`
+- GuideME `assets/<namespace>/ae2guide/**`
+- Patchouli resource-pack books
 
 ## Review workflow
 

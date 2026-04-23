@@ -3,16 +3,42 @@ from __future__ import annotations
 import fnmatch
 import io
 import json
+import re
+import tomllib
 import urllib.request
 import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .models import Record, SourceSpec
+from .progress import NullProgress
 
 
 USER_AGENT = "rubi-gto/0.1"
 MINECRAFT_VERSION_MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+GENERIC_MATCH_TOKENS = {
+    "addon",
+    "api",
+    "fabric",
+    "forge",
+    "gto",
+    "jar",
+    "lib",
+    "library",
+    "mc",
+    "mod",
+    "mods",
+    "neoforge",
+}
+DEFAULT_LOCAL_INCLUDE_GLOBS = ["**/assets/*/lang/ja_jp.json", "**/ja_jp.json"]
+DEFAULT_SOURCE_INCLUDE_GLOBS = ["src/main/resources/assets/*/lang/ja_jp.json", "**/assets/*/lang/ja_jp.json"]
+DEFAULT_ARCHIVE_INCLUDE_GLOBS = ["assets/*/lang/ja_jp.json"]
+DEFAULT_ANY_LANG_INCLUDE_GLOBS = ["**/assets/*/lang/*.json"]
+DEFAULT_GUIDEME_INCLUDE_GLOBS = ["assets/*/ae2guide/**"]
+DEFAULT_PATCHOULI_ASSET_INCLUDE_GLOBS = ["assets/*/patchouli_books/**"]
+DEFAULT_PATCHOULI_DATA_INCLUDE_GLOBS = ["data/*/patchouli_books/**"]
+FTBQUESTS_DIR_NAMES = {"ftbquests", "ftb_quests"}
+FTBQUESTS_ROOT_NAMES = {"quests", "normal"}
 
 
 def load_manifest(manifest_path: Path) -> tuple[dict[str, Any], list[SourceSpec]]:
@@ -107,6 +133,7 @@ def _records_from_json(
     origin: str,
     path: str,
     payload: Any,
+    source_id: str | None = None,
 ) -> list[Record]:
     namespace = _derive_lang_namespace(path, source.target_namespace) if source.json_mode == "lang" else source.target_namespace
     if not namespace:
@@ -124,21 +151,317 @@ def _records_from_json(
             source_text=value,
             annotated_text=value,
             source_origin=f"{origin}:{path}",
-            source_id=source.id,
+            source_id=source_id or source.id,
         )
         for key, value in items.items()
     ]
 
 
-def _ingest_local_dir(source: SourceSpec) -> list[Record]:
+def _iter_archive_paths(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    return sorted(
+        path
+        for path in root.iterdir()
+        if path.is_file() and path.suffix.lower() in {".jar", ".zip"}
+    )
+
+
+def _fallback_archive_source_id(archive_path: Path) -> str:
+    stem = archive_path.stem
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-")
+    return normalized or stem or archive_path.name
+
+
+def _archive_metadata(archive: zipfile.ZipFile, archive_path: Path) -> dict[str, Any]:
+    mod_ids: list[str] = []
+    display_names: list[str] = []
+
+    for metadata_name in ("META-INF/mods.toml", "META-INF/neoforge.mods.toml"):
+        try:
+            raw = archive.read(metadata_name).decode("utf-8")
+        except KeyError:
+            continue
+        try:
+            payload = tomllib.loads(raw)
+        except Exception:
+            continue
+        for mod in payload.get("mods", []):
+            mod_id = str(mod.get("modId", "")).strip()
+            display_name = str(mod.get("displayName", "")).strip()
+            if mod_id and mod_id not in mod_ids:
+                mod_ids.append(mod_id)
+            if display_name and display_name not in display_names:
+                display_names.append(display_name)
+
+    for metadata_name in ("fabric.mod.json", "quilt.mod.json"):
+        try:
+            raw_json = json.loads(archive.read(metadata_name).decode("utf-8"))
+        except (KeyError, json.JSONDecodeError):
+            continue
+        if metadata_name == "fabric.mod.json":
+            mod_id = str(raw_json.get("id", "")).strip()
+            display_name = str(raw_json.get("name", "")).strip()
+        else:
+            loader = raw_json.get("quilt_loader", {})
+            metadata = raw_json.get("metadata", {})
+            mod_id = str(loader.get("id", "")).strip()
+            display_name = str(metadata.get("name", "")).strip()
+        if mod_id and mod_id not in mod_ids:
+            mod_ids.append(mod_id)
+        if display_name and display_name not in display_names:
+            display_names.append(display_name)
+
+    return {
+        "source_id": mod_ids[0] if mod_ids else _fallback_archive_source_id(archive_path),
+        "mod_ids": mod_ids,
+        "display_names": display_names,
+    }
+
+
+def _archive_lang_members(archive: zipfile.ZipFile, include_globs: list[str]) -> list[str]:
+    return _archive_matching_members(archive, include_globs, suffixes={".json"})
+
+
+def _archive_matching_members(
+    archive: zipfile.ZipFile,
+    include_globs: list[str],
+    *,
+    suffixes: set[str] | None = None,
+) -> list[str]:
+    members: list[str] = []
+    for member in sorted(archive.namelist()):
+        pure_member = PurePosixPath(member)
+        if member.endswith("/"):
+            continue
+        if suffixes is not None and pure_member.suffix.lower() not in suffixes:
+            continue
+        if _path_matches(member, include_globs):
+            members.append(member)
+    return members
+
+
+def _dir_matching_members(
+    root: Path,
+    include_globs: list[str],
+    *,
+    suffixes: set[str] | None = None,
+) -> list[str]:
+    if not root.exists():
+        return []
+    members: list[str] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root).as_posix()
+        suffix = PurePosixPath(rel).suffix.lower()
+        if suffixes is not None and suffix not in suffixes:
+            continue
+        if _path_matches(rel, include_globs):
+            members.append(rel)
+    return members
+
+
+def _derive_locale_from_lang_path(path: str) -> str:
+    pure_path = PurePosixPath(path)
+    parts = pure_path.parts
+    if "lang" in parts:
+        index = parts.index("lang")
+        if index + 1 < len(parts):
+            return PurePosixPath(parts[index + 1]).stem
+    return pure_path.stem
+
+
+def _namespaces_from_asset_paths(paths: list[str]) -> list[str]:
+    namespaces: set[str] = set()
+    for path in paths:
+        try:
+            namespaces.add(_derive_lang_namespace(path, None))
+        except ValueError:
+            continue
+    return sorted(namespaces)
+
+
+def _patchouli_book_names(paths: list[str]) -> list[str]:
+    books: set[str] = set()
+    for path in paths:
+        parts = PurePosixPath(path).parts
+        if "patchouli_books" not in parts:
+            continue
+        index = parts.index("patchouli_books")
+        if index + 1 < len(parts):
+            books.add(parts[index + 1])
+    return sorted(books)
+
+
+def _pack_metadata_from_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {
+            "has_pack_mcmeta": True,
+            "pack_id": None,
+            "pack_description": None,
+            "pack_format": None,
+        }
+    pack = payload.get("pack", {})
+    description = pack.get("description") if isinstance(pack, dict) else None
+    if isinstance(description, dict):
+        description = description.get("text")
+    return {
+        "has_pack_mcmeta": True,
+        "pack_id": payload.get("id"),
+        "pack_description": description,
+        "pack_format": pack.get("pack_format") if isinstance(pack, dict) else None,
+    }
+
+
+def _pack_metadata_from_dir(root: Path) -> dict[str, Any]:
+    pack_path = root / "pack.mcmeta"
+    if not pack_path.exists():
+        return {
+            "has_pack_mcmeta": False,
+            "pack_id": None,
+            "pack_description": None,
+            "pack_format": None,
+        }
+    try:
+        payload = json.loads(pack_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {
+            "has_pack_mcmeta": True,
+            "pack_id": None,
+            "pack_description": None,
+            "pack_format": None,
+            "pack_mcmeta_error": str(exc),
+        }
+    return _pack_metadata_from_payload(payload)
+
+
+def _pack_metadata_from_archive(archive: zipfile.ZipFile) -> dict[str, Any]:
+    try:
+        raw = archive.read("pack.mcmeta").decode("utf-8")
+    except KeyError:
+        return {
+            "has_pack_mcmeta": False,
+            "pack_id": None,
+            "pack_description": None,
+            "pack_format": None,
+        }
+    except Exception as exc:
+        return {
+            "has_pack_mcmeta": True,
+            "pack_id": None,
+            "pack_description": None,
+            "pack_format": None,
+            "pack_mcmeta_error": str(exc),
+        }
+    try:
+        payload = json.loads(raw)
+    except Exception as exc:
+        return {
+            "has_pack_mcmeta": True,
+            "pack_id": None,
+            "pack_description": None,
+            "pack_format": None,
+            "pack_mcmeta_error": str(exc),
+        }
+    return _pack_metadata_from_payload(payload)
+
+
+def _normalize_source_id(label: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._:-]+", "-", label).strip("-")
+    return normalized or label
+
+
+def _archive_source_descriptor(
+    archive_path: Path,
+    *,
+    include_globs: list[str] | None = None,
+    source_id: str | None = None,
+) -> dict[str, Any]:
+    normalized_globs = list(include_globs or DEFAULT_ARCHIVE_INCLUDE_GLOBS)
+    with zipfile.ZipFile(archive_path) as archive:
+        metadata = _archive_metadata(archive, archive_path)
+        members = _archive_lang_members(archive, normalized_globs)
+        all_lang_members = _archive_matching_members(archive, list(DEFAULT_ANY_LANG_INCLUDE_GLOBS), suffixes={".json"})
+        guide_members = _archive_matching_members(archive, list(DEFAULT_GUIDEME_INCLUDE_GLOBS))
+        patchouli_asset_members = _archive_matching_members(archive, list(DEFAULT_PATCHOULI_ASSET_INCLUDE_GLOBS))
+        patchouli_data_members = _archive_matching_members(archive, list(DEFAULT_PATCHOULI_DATA_INCLUDE_GLOBS))
+        pack_metadata = _pack_metadata_from_archive(archive)
+    detected_namespaces = sorted({_derive_lang_namespace(member, None) for member in members})
+    return {
+        "id": source_id or str(metadata["source_id"]),
+        "type": "local_archive",
+        "path": str(archive_path.resolve()),
+        "include_globs": normalized_globs,
+        "archive_name": archive_path.name,
+        "detected_files": members,
+        "detected_namespaces": detected_namespaces,
+        "mod_ids": list(metadata["mod_ids"]),
+        "display_names": list(metadata["display_names"]),
+        "has_ja_jp": bool(members),
+        "all_lang_files": all_lang_members,
+        "all_lang_namespaces": _namespaces_from_asset_paths(all_lang_members),
+        "available_locales": sorted({_derive_locale_from_lang_path(member) for member in all_lang_members}),
+        "guide_files": guide_members,
+        "guide_namespaces": _namespaces_from_asset_paths(guide_members),
+        "patchouli_asset_files": patchouli_asset_members,
+        "patchouli_asset_namespaces": _namespaces_from_asset_paths(patchouli_asset_members),
+        "patchouli_data_files": patchouli_data_members,
+        "patchouli_book_names": _patchouli_book_names(patchouli_asset_members + patchouli_data_members),
+        **pack_metadata,
+    }
+
+
+def _dir_source_descriptor(
+    root: Path,
+    *,
+    include_globs: list[str] | None = None,
+    source_id: str | None = None,
+) -> dict[str, Any]:
+    normalized_globs = list(include_globs or DEFAULT_ARCHIVE_INCLUDE_GLOBS)
+    members = _dir_matching_members(root, normalized_globs, suffixes={".json"})
+    all_lang_members = _dir_matching_members(root, list(DEFAULT_ANY_LANG_INCLUDE_GLOBS), suffixes={".json"})
+    guide_members = _dir_matching_members(root, list(DEFAULT_GUIDEME_INCLUDE_GLOBS))
+    patchouli_asset_members = _dir_matching_members(root, list(DEFAULT_PATCHOULI_ASSET_INCLUDE_GLOBS))
+    patchouli_data_members = _dir_matching_members(root, list(DEFAULT_PATCHOULI_DATA_INCLUDE_GLOBS))
+    pack_metadata = _pack_metadata_from_dir(root)
+    detected_namespaces = sorted({_derive_lang_namespace(member, None) for member in members})
+    return {
+        "id": source_id or root.name,
+        "type": "local_dir",
+        "path": str(root.resolve()),
+        "include_globs": normalized_globs,
+        "entry_name": root.name,
+        "detected_files": members,
+        "detected_namespaces": detected_namespaces,
+        "has_ja_jp": bool(members),
+        "all_lang_files": all_lang_members,
+        "all_lang_namespaces": _namespaces_from_asset_paths(all_lang_members),
+        "available_locales": sorted({_derive_locale_from_lang_path(member) for member in all_lang_members}),
+        "guide_files": guide_members,
+        "guide_namespaces": _namespaces_from_asset_paths(guide_members),
+        "patchouli_asset_files": patchouli_asset_members,
+        "patchouli_asset_namespaces": _namespaces_from_asset_paths(patchouli_asset_members),
+        "patchouli_data_files": patchouli_data_members,
+        "patchouli_book_names": _patchouli_book_names(patchouli_asset_members + patchouli_data_members),
+        **pack_metadata,
+    }
+
+
+def _ingest_local_dir(source: SourceSpec, *, progress: NullProgress | None = None) -> list[Record]:
     if not source.path:
         raise ValueError(f"source {source.id} is missing path")
     root = Path(source.path)
     records: list[Record] = []
-    for file_path in sorted(root.rglob("*.json")):
+    matched_files = [
+        file_path
+        for file_path in sorted(root.rglob("*.json"))
+        if _path_matches(file_path.relative_to(root).as_posix(), source.include_globs)
+    ]
+    for index, file_path in enumerate(matched_files, start=1):
         rel = file_path.relative_to(root).as_posix()
-        if not _path_matches(rel, source.include_globs):
-            continue
+        if progress:
+            progress.item("FILE", index, len(matched_files), rel, source.id)
         with file_path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
         records.extend(
@@ -152,13 +475,14 @@ def _ingest_local_dir(source: SourceSpec) -> list[Record]:
     return records
 
 
-def _ingest_github_archive(source: SourceSpec) -> list[Record]:
+def _ingest_github_archive(source: SourceSpec, *, progress: NullProgress | None = None) -> list[Record]:
     if not source.owner or not source.repo:
         raise ValueError(f"source {source.id} is missing owner/repo")
     ref = _resolve_github_ref(source)
     archive_bytes = _http_bytes(_archive_url(source.owner, source.repo, ref))
     records: list[Record] = []
     with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+        matched_members = []
         for member in sorted(archive.namelist()):
             pure_member = PurePosixPath(member)
             if member.endswith("/") or pure_member.suffix.lower() != ".json":
@@ -167,6 +491,13 @@ def _ingest_github_archive(source: SourceSpec) -> list[Record]:
             rel = PurePosixPath(*relative_parts).as_posix()
             if not _path_matches(rel, source.include_globs):
                 continue
+            matched_members.append(member)
+        for index, member in enumerate(matched_members, start=1):
+            pure_member = PurePosixPath(member)
+            relative_parts = pure_member.parts[1:]
+            rel = PurePosixPath(*relative_parts).as_posix()
+            if progress:
+                progress.item("FILE", index, len(matched_members), rel, source.id)
             with archive.open(member) as handle:
                 payload = json.loads(handle.read().decode("utf-8"))
             records.extend(
@@ -190,7 +521,7 @@ def _resolve_minecraft_version(source: SourceSpec) -> dict[str, Any]:
     raise ValueError(f"minecraft version {source.minecraft_version} not found in official manifest")
 
 
-def _ingest_minecraft_assets(source: SourceSpec) -> list[Record]:
+def _ingest_minecraft_assets(source: SourceSpec, *, progress: NullProgress | None = None) -> list[Record]:
     locale = source.locale or "ja_jp"
     version_payload = _resolve_minecraft_version(source)
     asset_index = _http_json(version_payload["assetIndex"]["url"])
@@ -199,6 +530,8 @@ def _ingest_minecraft_assets(source: SourceSpec) -> list[Record]:
     if not asset:
         raise ValueError(f"asset index does not contain {asset_key}")
     payload = json.loads(_http_bytes(_minecraft_asset_url(asset["hash"])).decode("utf-8"))
+    if progress:
+        progress.note("ASSET", f"{asset_key}  minecraft {source.minecraft_version}")
     return _records_from_json(
         source=source,
         origin=f"minecraft:{source.minecraft_version}:{locale}",
@@ -207,44 +540,878 @@ def _ingest_minecraft_assets(source: SourceSpec) -> list[Record]:
     )
 
 
-def ingest_sources(sources: list[SourceSpec]) -> tuple[list[Record], list[dict[str, str]]]:
+def _ingest_local_archive(source: SourceSpec, *, progress: NullProgress | None = None) -> list[Record]:
+    if not source.path:
+        raise ValueError(f"source {source.id} is missing path")
+    archive_path = Path(source.path)
     records: list[Record] = []
-    errors: list[dict[str, str]] = []
-    for source in sources:
+    with zipfile.ZipFile(archive_path) as archive:
+        members = _archive_lang_members(archive, source.include_globs or list(DEFAULT_ARCHIVE_INCLUDE_GLOBS))
+        for member_index, member in enumerate(members, start=1):
+            if progress:
+                progress.item("LANG", member_index, len(members), member, archive_path.name)
+            payload = json.loads(archive.read(member).decode("utf-8"))
+            records.extend(
+                _records_from_json(
+                    source=source,
+                    origin=str(archive_path.resolve()),
+                    path=member,
+                    payload=payload,
+                )
+            )
+    return records
+
+
+def _ingest_local_mod_archives(source: SourceSpec, *, progress: NullProgress | None = None) -> list[Record]:
+    if not source.path:
+        raise ValueError(f"source {source.id} is missing path")
+    root = Path(source.path)
+    archives = _iter_archive_paths(root)
+    records: list[Record] = []
+    for archive_index, archive_path in enumerate(archives, start=1):
+        try:
+            with zipfile.ZipFile(archive_path) as archive:
+                metadata = _archive_metadata(archive, archive_path)
+                members = _archive_lang_members(archive, source.include_globs or list(DEFAULT_ARCHIVE_INCLUDE_GLOBS))
+        except zipfile.BadZipFile:
+            if progress:
+                progress.note("SKIP", f"{archive_path.name}  invalid archive")
+            continue
+        detail = f"{metadata['source_id']}  matches={len(members)}"
+        if progress:
+            progress.item("ARCHIVE", archive_index, len(archives), archive_path.name, detail)
+        with zipfile.ZipFile(archive_path) as archive:
+            for member_index, member in enumerate(members, start=1):
+                if progress:
+                    progress.item("LANG", member_index, len(members), member, archive_path.name)
+                payload = json.loads(archive.read(member).decode("utf-8"))
+                records.extend(
+                    _records_from_json(
+                        source=source,
+                        origin=str(archive_path.resolve()),
+                        path=member,
+                        payload=payload,
+                        source_id=str(metadata["source_id"]),
+                    )
+                )
+    return records
+
+
+def ingest_sources_with_report(
+    sources: list[SourceSpec],
+    *,
+    progress: NullProgress | None = None,
+) -> tuple[list[Record], list[dict[str, Any]]]:
+    records: list[Record] = []
+    source_results: list[dict[str, Any]] = []
+    reporter = progress or NullProgress()
+    enabled_sources = [source for source in sources if source.enabled]
+    for index, source in enumerate(enabled_sources, start=1):
+        reporter.item("SOURCE", index, len(enabled_sources), source.id, source.type)
+        result: dict[str, Any] = {
+            "source_id": source.id,
+            "type": source.type,
+            "path": source.path,
+            "record_count": 0,
+            "status": "ok",
+            "error": None,
+        }
         if not source.enabled:
             continue
         try:
             if source.type == "github_repo_archive":
-                records.extend(_ingest_github_archive(source))
+                source_records = _ingest_github_archive(source, progress=reporter)
             elif source.type == "minecraft_assets":
-                records.extend(_ingest_minecraft_assets(source))
+                source_records = _ingest_minecraft_assets(source, progress=reporter)
             elif source.type == "local_dir":
-                records.extend(_ingest_local_dir(source))
+                source_records = _ingest_local_dir(source, progress=reporter)
+            elif source.type == "local_archive":
+                source_records = _ingest_local_archive(source, progress=reporter)
+            elif source.type == "local_mod_archives":
+                source_records = _ingest_local_mod_archives(source, progress=reporter)
             else:
                 raise ValueError(f"unsupported source type: {source.type}")
+            records.extend(source_records)
+            result["record_count"] = len(source_records)
+            reporter.done("SOURCE", f"{source.id}  records={len(source_records)}")
         except Exception as exc:
-            errors.append({"source_id": source.id, "error": str(exc)})
+            result["status"] = "error"
+            result["error"] = str(exc)
+            reporter.note("FAIL", f"{source.id}  {exc}")
+            reporter.done("SOURCE", f"{source.id}  error={exc}")
+        source_results.append(result)
+    return records, source_results
+
+
+def ingest_sources(
+    sources: list[SourceSpec],
+    *,
+    progress: NullProgress | None = None,
+) -> tuple[list[Record], list[dict[str, str]]]:
+    records, source_results = ingest_sources_with_report(sources, progress=progress)
+    errors = [
+        {"source_id": str(item["source_id"]), "error": str(item["error"])}
+        for item in source_results
+        if item.get("status") == "error"
+    ]
     return records, errors
+
+
+def _source_root_for_match(match: Path, search_root: Path) -> Path:
+    current = match.parent
+    while True:
+        if (current / ".git").exists():
+            return current
+        if current == search_root:
+            break
+        if search_root not in current.parents:
+            break
+        current = current.parent
+
+    parts = match.relative_to(search_root).parts
+    if not parts:
+        return search_root
+    return search_root / parts[0]
+
+
+def _search_terms_for_mod(mod: dict[str, Any]) -> list[str]:
+    filename_stem = Path(str(mod.get("filename", ""))).stem
+    values = [str(mod.get("name", "")), str(mod.get("id", "")), filename_stem]
+    terms: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        cleaned = value.strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        terms.append(cleaned)
+    return terms
+
+
+def _source_stub_examples(mod: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    source_id = str(mod.get("id", "mod"))
+    search_terms = _search_terms_for_mod(mod)
+    repo_guess = re.sub(r"[^A-Za-z0-9._-]+", "-", search_terms[0]).strip("-") if search_terms else source_id
+    return {
+        "local_dir": {
+            "id": source_id,
+            "type": "local_dir",
+            "path": f"../gto_repos/{repo_guess}",
+            "include_globs": list(DEFAULT_LOCAL_INCLUDE_GLOBS),
+        },
+        "github_repo_archive": {
+            "id": source_id,
+            "type": "github_repo_archive",
+            "owner": "REPLACE_ME",
+            "repo": repo_guess,
+            "ref": "main",
+            "include_globs": list(DEFAULT_SOURCE_INCLUDE_GLOBS),
+        },
+    }
 
 
 def discover_local_sources(search_root: Path) -> list[dict[str, Any]]:
     discovered: list[dict[str, Any]] = []
-    include_globs = ["**/assets/*/lang/ja_jp.json", "**/ja_jp.json"]
-    for candidate in sorted(path for path in search_root.iterdir() if path.is_dir()):
-        matches = sorted(
-            match.relative_to(candidate).as_posix()
-            for match in candidate.rglob("*.json")
-            if _path_matches(match.relative_to(candidate).as_posix(), include_globs)
-        )
+    grouped_matches: dict[Path, list[str]] = {}
+    for match in sorted(search_root.rglob("*.json")):
+        rel_to_root = match.relative_to(search_root).as_posix()
+        if not _path_matches(rel_to_root, DEFAULT_LOCAL_INCLUDE_GLOBS):
+            continue
+        candidate = _source_root_for_match(match, search_root)
+        grouped_matches.setdefault(candidate, []).append(match.relative_to(candidate).as_posix())
+
+    for candidate in sorted(grouped_matches):
+        matches = sorted(set(grouped_matches[candidate]))
         if not matches:
             continue
+        detected_namespaces = sorted(
+            {
+                _derive_lang_namespace(match, None)
+                for match in matches
+                if "assets/" in match and "/lang/ja_jp.json" in match
+            }
+        )
         discovered.append(
             {
                 "id": candidate.name,
                 "type": "local_dir",
                 "path": str(candidate.resolve()),
-                "include_globs": include_globs,
+                "include_globs": list(DEFAULT_LOCAL_INCLUDE_GLOBS),
                 "detected_files": matches,
+                "detected_namespaces": detected_namespaces,
             }
         )
     return discovered
+
+
+def discover_mod_archives(mods_dir: Path, *, source_id: str = "mods-folder") -> dict[str, Any]:
+    archives = _iter_archive_paths(mods_dir)
+    entries: list[dict[str, Any]] = []
+    sources: list[dict[str, Any]] = []
+    skipped_archives: list[dict[str, Any]] = []
+    failed_archives: list[dict[str, Any]] = []
+    detected_namespaces: set[str] = set()
+    all_lang_namespaces: set[str] = set()
+    guide_namespaces: set[str] = set()
+    patchouli_asset_namespaces: set[str] = set()
+    patchouli_book_names: set[str] = set()
+    used_ids: dict[str, int] = {}
+
+    for archive_path in archives:
+        try:
+            descriptor = _archive_source_descriptor(archive_path, include_globs=list(DEFAULT_ARCHIVE_INCLUDE_GLOBS))
+        except zipfile.BadZipFile:
+            failed_archives.append(
+                {
+                    "archive_name": archive_path.name,
+                    "path": str(archive_path.resolve()),
+                    "error": "invalid_archive",
+                }
+            )
+            continue
+        except Exception as exc:
+            failed_archives.append(
+                {
+                    "archive_name": archive_path.name,
+                    "path": str(archive_path.resolve()),
+                    "error": str(exc),
+                }
+            )
+            continue
+        has_relevant_content = bool(
+            descriptor["all_lang_files"]
+            or descriptor["guide_files"]
+            or descriptor["patchouli_asset_files"]
+            or descriptor["patchouli_data_files"]
+        )
+        if not has_relevant_content:
+            skipped_archives.append(
+                {
+                    "archive_name": archive_path.name,
+                    "path": str(archive_path.resolve()),
+                    "reason": "no_relevant_lang_or_book_files",
+                }
+            )
+            continue
+        base_id = str(descriptor["id"])
+        sequence = used_ids.get(base_id, 0) + 1
+        used_ids[base_id] = sequence
+        if sequence > 1:
+            descriptor["id"] = f"{base_id}#{sequence}"
+            descriptor["base_id"] = base_id
+        entries.append(descriptor)
+        detected_namespaces.update(descriptor["detected_namespaces"])
+        all_lang_namespaces.update(descriptor.get("all_lang_namespaces", []))
+        guide_namespaces.update(descriptor.get("guide_namespaces", []))
+        patchouli_asset_namespaces.update(descriptor.get("patchouli_asset_namespaces", []))
+        patchouli_book_names.update(descriptor.get("patchouli_book_names", []))
+        if descriptor["has_ja_jp"]:
+            sources.append(descriptor)
+
+    return {
+        "id": source_id,
+        "archive_count": len(archives),
+        "detected_archive_count": len(entries),
+        "ja_source_count": len(sources),
+        "detected_namespaces": sorted(detected_namespaces),
+        "all_lang_namespaces": sorted(all_lang_namespaces),
+        "guide_namespaces": sorted(guide_namespaces),
+        "patchouli_asset_namespaces": sorted(patchouli_asset_namespaces),
+        "patchouli_book_names": sorted(patchouli_book_names),
+        "entries": entries,
+        "sources": sources,
+        "skipped_archives": skipped_archives,
+        "failed_archives": failed_archives,
+    }
+
+
+def build_local_manifest(
+    search_root: Path,
+    *,
+    pack_description: str,
+    pack_format: int,
+    include_vanilla: bool = False,
+    minecraft_version: str = "1.20.1",
+    locale: str = "ja_jp",
+    extra_sources: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    sources = discover_local_sources(search_root)
+    if extra_sources:
+        sources.extend(extra_sources)
+    if include_vanilla:
+        sources.insert(
+            0,
+            {
+                "id": f"minecraft-vanilla-{minecraft_version}",
+                "type": "minecraft_assets",
+                "minecraft_version": minecraft_version,
+                "locale": locale,
+                "target_namespace": "minecraft",
+            },
+        )
+    return {
+        "pack": {
+            "description": pack_description,
+            "pack_format": pack_format,
+        },
+        "build": {
+            "include_generated_by_default": True,
+            "include_pending_by_default": True,
+        },
+        "sources": sources,
+    }
+
+
+def build_mod_archive_manifest(
+    mods_dir: Path,
+    *,
+    pack_description: str,
+    pack_format: int,
+    include_vanilla: bool = False,
+    minecraft_version: str = "1.20.1",
+    locale: str = "ja_jp",
+    source_id: str = "mods-folder",
+) -> dict[str, Any]:
+    discovery = discover_mod_archives(mods_dir, source_id=source_id)
+    sources = list(discovery["sources"])
+    if include_vanilla:
+        sources.insert(
+            0,
+            {
+                "id": f"minecraft-vanilla-{minecraft_version}",
+                "type": "minecraft_assets",
+                "minecraft_version": minecraft_version,
+                "locale": locale,
+                "target_namespace": "minecraft",
+            },
+        )
+    return {
+        "pack": {
+            "description": pack_description,
+            "pack_format": pack_format,
+        },
+        "build": {
+            "include_generated_by_default": True,
+            "include_pending_by_default": True,
+        },
+        "discovery": discovery,
+        "sources": sources,
+    }
+
+
+def _pack_candidate_entries(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    return sorted(
+        path
+        for path in root.iterdir()
+        if path.is_dir() or (path.is_file() and path.suffix.lower() in {".zip", ".jar"})
+    )
+
+
+def discover_resource_packs(root: Path, *, source_prefix: str) -> dict[str, Any]:
+    candidates = _pack_candidate_entries(root)
+    entries: list[dict[str, Any]] = []
+    sources: list[dict[str, Any]] = []
+    skipped_packs: list[dict[str, Any]] = []
+    failed_packs: list[dict[str, Any]] = []
+    detected_namespaces: set[str] = set()
+    all_lang_namespaces: set[str] = set()
+    available_locales: set[str] = set()
+    guide_namespaces: set[str] = set()
+    patchouli_asset_namespaces: set[str] = set()
+    patchouli_book_names: set[str] = set()
+    used_ids: dict[str, int] = {}
+
+    for entry_path in candidates:
+        try:
+            if entry_path.is_dir():
+                base_label = entry_path.name
+                descriptor = _dir_source_descriptor(entry_path, include_globs=list(DEFAULT_ARCHIVE_INCLUDE_GLOBS))
+            else:
+                base_label = entry_path.stem
+                descriptor = _archive_source_descriptor(entry_path, include_globs=list(DEFAULT_ARCHIVE_INCLUDE_GLOBS))
+        except zipfile.BadZipFile:
+            failed_packs.append(
+                {
+                    "entry_name": entry_path.name,
+                    "path": str(entry_path.resolve()),
+                    "error": "invalid_archive",
+                }
+            )
+            continue
+        except Exception as exc:
+            failed_packs.append(
+                {
+                    "entry_name": entry_path.name,
+                    "path": str(entry_path.resolve()),
+                    "error": str(exc),
+                }
+            )
+            continue
+
+        has_relevant_content = bool(
+            descriptor["all_lang_files"]
+            or descriptor["guide_files"]
+            or descriptor["patchouli_asset_files"]
+            or descriptor["patchouli_data_files"]
+        )
+        if not has_relevant_content:
+            skipped_packs.append(
+                {
+                    "entry_name": entry_path.name,
+                    "path": str(entry_path.resolve()),
+                    "reason": "no_relevant_lang_or_book_files",
+                }
+            )
+            continue
+
+        base_id = _normalize_source_id(f"{source_prefix}:{descriptor.get('pack_id') or base_label}")
+        sequence = used_ids.get(base_id, 0) + 1
+        used_ids[base_id] = sequence
+        descriptor["id"] = base_id if sequence == 1 else f"{base_id}#{sequence}"
+        if sequence > 1:
+            descriptor["base_id"] = base_id
+
+        entries.append(descriptor)
+        detected_namespaces.update(descriptor.get("detected_namespaces", []))
+        all_lang_namespaces.update(descriptor.get("all_lang_namespaces", []))
+        available_locales.update(descriptor.get("available_locales", []))
+        guide_namespaces.update(descriptor.get("guide_namespaces", []))
+        patchouli_asset_namespaces.update(descriptor.get("patchouli_asset_namespaces", []))
+        patchouli_book_names.update(descriptor.get("patchouli_book_names", []))
+        if descriptor["has_ja_jp"]:
+            sources.append(descriptor)
+
+    return {
+        "root": str(root.resolve()),
+        "pack_count": len(candidates),
+        "detected_pack_count": len(entries),
+        "ja_source_count": len(sources),
+        "detected_namespaces": sorted(detected_namespaces),
+        "all_lang_namespaces": sorted(all_lang_namespaces),
+        "available_locales": sorted(available_locales),
+        "guide_namespaces": sorted(guide_namespaces),
+        "patchouli_asset_namespaces": sorted(patchouli_asset_namespaces),
+        "patchouli_book_names": sorted(patchouli_book_names),
+        "entries": entries,
+        "sources": sources,
+        "skipped_packs": skipped_packs,
+        "failed_packs": failed_packs,
+    }
+
+
+def discover_ftbquests(instance_root: Path) -> dict[str, Any]:
+    config_root = instance_root / "config"
+    if not config_root.exists():
+        return {
+            "config_root": str(config_root.resolve()),
+            "quest_root_count": 0,
+            "entries": [],
+        }
+
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for directory in sorted(config_root.rglob("*")):
+        if not directory.is_dir() or directory.name not in FTBQUESTS_DIR_NAMES:
+            continue
+        for root_name in FTBQUESTS_ROOT_NAMES:
+            quest_root = directory / root_name
+            if not quest_root.exists() or not quest_root.is_dir():
+                continue
+            resolved = str(quest_root.resolve())
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            roots.append(quest_root)
+
+    entries: list[dict[str, Any]] = []
+    for quest_root in sorted(roots):
+        snbt_files = sorted(path.relative_to(quest_root).as_posix() for path in quest_root.rglob("*.snbt"))
+        lang_files = [path for path in snbt_files if path.startswith("lang/")]
+        content_files = [path for path in snbt_files if not path.startswith("lang/")]
+        entries.append(
+            {
+                "path": str(quest_root.resolve()),
+                "file_count": len(snbt_files),
+                "content_file_count": len(content_files),
+                "lang_file_count": len(lang_files),
+                "available_locales": sorted({_derive_locale_from_lang_path(path) for path in lang_files}),
+                "has_data_snbt": "data.snbt" in snbt_files,
+                "has_chapter_groups_snbt": "chapter_groups.snbt" in snbt_files,
+                "localization_style": "locale_snbt" if lang_files else "inline_or_key_rewritten",
+                "sample_files": snbt_files[:20],
+            }
+        )
+
+    return {
+        "config_root": str(config_root.resolve()),
+        "quest_root_count": len(entries),
+        "entries": entries,
+    }
+
+
+def discover_patchouli_external_books(instance_root: Path) -> dict[str, Any]:
+    patchouli_root = instance_root / "patchouli_books"
+    if not patchouli_root.exists():
+        return {
+            "root": str(patchouli_root.resolve()),
+            "book_count": 0,
+            "entries": [],
+        }
+
+    entries: list[dict[str, Any]] = []
+    for book_json in sorted(patchouli_root.glob("*/book.json")):
+        book_root = book_json.parent
+        entries.append(
+            {
+                "book_name": book_root.name,
+                "path": str(book_root.resolve()),
+                "has_book_json": True,
+                "asset_files": _dir_matching_members(book_root, list(DEFAULT_PATCHOULI_ASSET_INCLUDE_GLOBS)),
+                "data_files": _dir_matching_members(book_root, list(DEFAULT_PATCHOULI_DATA_INCLUDE_GLOBS)),
+            }
+        )
+
+    return {
+        "root": str(patchouli_root.resolve()),
+        "book_count": len(entries),
+        "entries": entries,
+    }
+
+
+def _guide_entries(label: str, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    guide_entries: list[dict[str, Any]] = []
+    for entry in entries:
+        guide_files = list(entry.get("guide_files", []))
+        if not guide_files:
+            continue
+        guide_entries.append(
+            {
+                "location_type": label,
+                "source_id": entry.get("id"),
+                "path": entry.get("path"),
+                "guide_namespaces": list(entry.get("guide_namespaces", [])),
+                "file_count": len(guide_files),
+            }
+        )
+    return guide_entries
+
+
+def _patchouli_entries(label: str, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    patchouli_entries: list[dict[str, Any]] = []
+    for entry in entries:
+        asset_files = list(entry.get("patchouli_asset_files", []))
+        data_files = list(entry.get("patchouli_data_files", []))
+        if not asset_files and not data_files:
+            continue
+        patchouli_entries.append(
+            {
+                "location_type": label,
+                "source_id": entry.get("id"),
+                "path": entry.get("path"),
+                "patchouli_asset_namespaces": list(entry.get("patchouli_asset_namespaces", [])),
+                "patchouli_book_names": list(entry.get("patchouli_book_names", [])),
+                "asset_file_count": len(asset_files),
+                "data_file_count": len(data_files),
+            }
+        )
+    return patchouli_entries
+
+
+def _instance_override_rules() -> list[dict[str, str]]:
+    return [
+        {
+            "content_type": "openloader_resource_pack",
+            "override_path": "config/openloader/resources/<pack>/...",
+            "rule": "Open Loader loads folder and zip resource packs from config/openloader/resources with normal resource-pack semantics.",
+        },
+        {
+            "content_type": "ftbquests_1_20_keyed_text",
+            "override_path": "assets/<namespace>/lang/ja_jp.json",
+            "rule": "On 1.20.1 GTO-style packs, quest SNBT is rewritten to translation keys and the visible text comes from a resource-pack lang file with the same namespace and keys.",
+        },
+        {
+            "content_type": "ftbquests_1_21_locale_snbt",
+            "override_path": "config/ftb_quests/quests/lang/<locale>.snbt",
+            "rule": "On newer FTB Quests releases, localized quest text lives in lang/<locale>.snbt alongside the quest data instead of JSON lang files.",
+        },
+        {
+            "content_type": "guideme_ae2guide",
+            "override_path": "assets/<namespace>/ae2guide/**",
+            "rule": "GuideME loads pages from the ae2guide subtree of all resource packs across all namespaces.",
+        },
+        {
+            "content_type": "patchouli_resource_pack_books",
+            "override_path": "assets/<namespace>/patchouli_books/** and data/<namespace>/patchouli_books/<book>/book.json",
+            "rule": "Patchouli book contents override through the resource-pack asset paths when use_resource_pack is enabled; the book declaration stays under data or the external patchouli_books folder.",
+        },
+    ]
+
+
+def build_instance_manifest(
+    instance_root: Path,
+    *,
+    pack_description: str,
+    pack_format: int,
+    include_vanilla: bool = False,
+    minecraft_version: str = "1.20.1",
+    locale: str = "ja_jp",
+) -> dict[str, Any]:
+    mods = discover_mod_archives(instance_root / "mods", source_id="mods-folder")
+    openloader_resources = discover_resource_packs(
+        instance_root / "config" / "openloader" / "resources",
+        source_prefix="openloader",
+    )
+    resourcepacks = discover_resource_packs(
+        instance_root / "resourcepacks",
+        source_prefix="resourcepack",
+    )
+    sources: list[dict[str, Any]] = []
+    if include_vanilla:
+        sources.append(
+            {
+                "id": f"minecraft-vanilla-{minecraft_version}",
+                "type": "minecraft_assets",
+                "minecraft_version": minecraft_version,
+                "locale": locale,
+                "target_namespace": "minecraft",
+            }
+        )
+    sources.extend(mods["sources"])
+    sources.extend(openloader_resources["sources"])
+    sources.extend(resourcepacks["sources"])
+    return {
+        "pack": {
+            "description": pack_description,
+            "pack_format": pack_format,
+        },
+        "build": {
+            "include_generated_by_default": True,
+            "include_pending_by_default": True,
+        },
+        "discovery": {
+            "instance_root": str(instance_root.resolve()),
+            "mods": mods,
+            "openloader_resources": openloader_resources,
+            "resourcepacks": resourcepacks,
+        },
+        "sources": sources,
+    }
+
+
+def build_instance_content_report(
+    instance_root: Path,
+    *,
+    pack_description: str,
+    pack_format: int,
+    include_vanilla: bool = False,
+    minecraft_version: str = "1.20.1",
+    locale: str = "ja_jp",
+) -> dict[str, Any]:
+    manifest = build_instance_manifest(
+        instance_root,
+        pack_description=pack_description,
+        pack_format=pack_format,
+        include_vanilla=include_vanilla,
+        minecraft_version=minecraft_version,
+        locale=locale,
+    )
+    mods = manifest["discovery"]["mods"]
+    openloader_resources = manifest["discovery"]["openloader_resources"]
+    resourcepacks = manifest["discovery"]["resourcepacks"]
+    ftbquests = discover_ftbquests(instance_root)
+    patchouli_external = discover_patchouli_external_books(instance_root)
+    guide_sources = (
+        _guide_entries("mods", list(mods.get("entries", [])))
+        + _guide_entries("openloader_resources", list(openloader_resources.get("entries", [])))
+        + _guide_entries("resourcepacks", list(resourcepacks.get("entries", [])))
+    )
+    patchouli_sources = (
+        _patchouli_entries("mods", list(mods.get("entries", [])))
+        + _patchouli_entries("openloader_resources", list(openloader_resources.get("entries", [])))
+        + _patchouli_entries("resourcepacks", list(resourcepacks.get("entries", [])))
+    )
+    for entry in patchouli_external.get("entries", []):
+        patchouli_sources.append(
+            {
+                "location_type": "patchouli_books",
+                "source_id": entry.get("book_name"),
+                "path": entry.get("path"),
+                "patchouli_asset_namespaces": [],
+                "patchouli_book_names": [entry.get("book_name")],
+                "asset_file_count": len(entry.get("asset_files", [])),
+                "data_file_count": len(entry.get("data_files", [])) + (1 if entry.get("has_book_json") else 0),
+            }
+        )
+
+    return {
+        "instance_root": str(instance_root.resolve()),
+        "lang_source_count": len(manifest["sources"]),
+        "manifest": manifest,
+        "mods": mods,
+        "openloader_resources": openloader_resources,
+        "resourcepacks": resourcepacks,
+        "ftbquests": ftbquests,
+        "patchouli_external_books": patchouli_external,
+        "guide_sources": guide_sources,
+        "patchouli_sources": patchouli_sources,
+        "override_rules": _instance_override_rules(),
+    }
+
+
+def _normalize_label(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+
+def _tokenize_label(text: str) -> set[str]:
+    return {
+        token
+        for token in re.split(r"[^a-z0-9]+", text.lower())
+        if token and token not in GENERIC_MATCH_TOKENS and len(token) > 1
+    }
+
+
+def _packwiz_update_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    update = payload.get("update", {})
+    if "curseforge" in update:
+        curseforge = update["curseforge"]
+        return {
+            "source": "curseforge",
+            "project_id": curseforge.get("project-id"),
+            "file_id": curseforge.get("file-id"),
+        }
+    if "modrinth" in update:
+        modrinth = update["modrinth"]
+        return {
+            "source": "modrinth",
+            "mod_id": modrinth.get("mod-id"),
+            "version_id": modrinth.get("version"),
+        }
+    return {"source": None}
+
+
+def _parse_packwiz_mod(mod_path: Path) -> dict[str, Any]:
+    payload = tomllib.loads(mod_path.read_text(encoding="utf-8"))
+    update = _packwiz_update_metadata(payload)
+    return {
+        "id": mod_path.stem.replace(".pw", ""),
+        "name": payload.get("name", mod_path.stem),
+        "filename": payload.get("filename", ""),
+        "side": payload.get("side", ""),
+        "update": update,
+        "path": str(mod_path.resolve()),
+    }
+
+
+def discover_packwiz_mods(pack_root: Path) -> list[dict[str, Any]]:
+    mods_dir = pack_root / "mods"
+    if not mods_dir.exists():
+        raise FileNotFoundError(f"packwiz mods directory not found at {mods_dir}")
+    return [_parse_packwiz_mod(path) for path in sorted(mods_dir.glob("*.pw.toml"))]
+
+
+def _repo_match_details(mod: dict[str, Any], source: dict[str, Any]) -> dict[str, Any] | None:
+    source_id = str(source.get("id", ""))
+    source_norm = _normalize_label(source_id)
+    source_tokens = _tokenize_label(source_id)
+    source_tokens.update(_tokenize_label(str(Path(source.get("path", "")).name)))
+    for namespace in source.get("detected_namespaces", []):
+        source_tokens.update(_tokenize_label(str(namespace)))
+
+    mod_id = str(mod.get("id", ""))
+    mod_name = str(mod.get("name", ""))
+    mod_filename = str(mod.get("filename", ""))
+    mod_tokens = _tokenize_label(mod_id)
+    mod_tokens.update(_tokenize_label(mod_name))
+    mod_tokens.update(_tokenize_label(Path(mod_filename).stem))
+    mod_norm_candidates = {
+        _normalize_label(mod_id),
+        _normalize_label(mod_name),
+        _normalize_label(Path(mod_filename).stem),
+    }
+
+    reasons: list[str] = []
+    score = 0
+    for mod_norm in mod_norm_candidates:
+        if not mod_norm:
+            continue
+        if mod_norm == source_norm:
+            score += 8
+            reasons.append(f"normalized_exact:{mod_norm}")
+        elif len(mod_norm) >= 4 and (mod_norm in source_norm or source_norm in mod_norm):
+            score += 5
+            reasons.append(f"normalized_contains:{mod_norm}")
+
+    overlap = sorted(mod_tokens & source_tokens)
+    if overlap:
+        source_coverage = len(overlap) / max(1, len(source_tokens))
+        mod_coverage = len(overlap) / max(1, len(mod_tokens))
+        if len(overlap) >= 3 or min(source_coverage, mod_coverage) >= 0.67:
+            score += len(overlap) * 2
+            reasons.append(f"token_overlap:{','.join(overlap)}")
+            reasons.append(f"token_coverage:{source_coverage:.2f}:{mod_coverage:.2f}")
+
+    if score < 4:
+        return None
+    return {
+        "id": source_id,
+        "path": source.get("path"),
+        "detected_namespaces": list(source.get("detected_namespaces", [])),
+        "score": score,
+        "reasons": reasons,
+    }
+
+
+def build_packwiz_translation_report(pack_root: Path, search_root: Path) -> dict[str, Any]:
+    local_sources = discover_local_sources(search_root)
+    mods_dir = pack_root / "mods"
+    if mods_dir.exists():
+        archive_source = discover_mod_archives(mods_dir, source_id="mods-folder")
+        local_sources.extend(list(archive_source.get("sources", [])))
+    mods = discover_packwiz_mods(pack_root)
+    enriched_mods: list[dict[str, Any]] = []
+    upstream_lookup_candidates: list[dict[str, Any]] = []
+    matched_count = 0
+    unresolved_count = 0
+
+    for mod in mods:
+        matches = sorted(
+            (
+                match
+                for match in (_repo_match_details(mod, source) for source in local_sources)
+                if match is not None
+            ),
+            key=lambda item: (-int(item["score"]), str(item["id"])),
+        )
+        if matches:
+            matched_count += 1
+        else:
+            unresolved_count += 1
+            upstream_lookup_candidates.append(
+                {
+                    "id": mod["id"],
+                    "name": mod["name"],
+                    "filename": mod["filename"],
+                    "side": mod["side"],
+                    "update": mod["update"],
+                    "search_terms": _search_terms_for_mod(mod),
+                    "source_stub_examples": _source_stub_examples(mod),
+                }
+            )
+        enriched_mod = dict(mod)
+        enriched_mod["likely_local_translation_repo_matches"] = matches
+        enriched_mod["needs_upstream_lookup"] = not bool(matches)
+        enriched_mods.append(enriched_mod)
+
+    return {
+        "pack_root": str(pack_root.resolve()),
+        "search_root": str(search_root.resolve()),
+        "local_source_count": len(local_sources),
+        "mod_count": len(enriched_mods),
+        "mods_with_likely_local_translation_repo": matched_count,
+        "mods_without_likely_local_translation_repo": unresolved_count,
+        "local_sources": local_sources,
+        "upstream_lookup_candidates": upstream_lookup_candidates,
+        "mods": enriched_mods,
+    }

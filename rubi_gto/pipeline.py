@@ -9,8 +9,9 @@ from .annotator import apply_glossary, validate_annotation
 from .io_utils import ensure_dir, read_json, write_json
 from .japanese import ConsensusAnnotator, categorize_review_candidate
 from .models import Record
+from .progress import NullProgress
 from .sources import (
-    ingest_sources,
+    ingest_sources_with_report,
     load_manifest,
     manifest_include_generated_default,
     manifest_include_pending_default,
@@ -61,9 +62,36 @@ def _read_records(path: Path) -> list[Record]:
     return [Record.from_dict(item) for item in payload]
 
 
-def ingest(manifest_path: Path, workspace: Path) -> dict[str, Any]:
+def _selected_source_ids_from_previous_report(workspace: Path) -> list[str]:
+    report = read_json(workspace / SOURCE_REPORT_PATH, default={})
+    return list(report.get("failed_source_ids", []))
+
+
+def ingest_with_progress(
+    manifest_path: Path,
+    workspace: Path,
+    progress: NullProgress | None,
+    *,
+    source_ids: list[str] | None = None,
+    failed_only: bool = False,
+) -> dict[str, Any]:
     manifest, sources = load_manifest(manifest_path)
-    records, errors = ingest_sources(sources)
+    reporter = progress or NullProgress()
+    reporter.stage("Ingest", manifest_path.name)
+    selected_ids: list[str] = list(source_ids or [])
+    if failed_only:
+        selected_ids.extend(_selected_source_ids_from_previous_report(workspace))
+    selected_id_set = set(selected_ids)
+    if source_ids or failed_only:
+        sources = [source for source in sources if source.id in selected_id_set]
+        reporter.note("FILTER", f"selected sources={len(sources)}")
+
+    records, source_results = ingest_sources_with_report(sources, progress=reporter)
+    errors = [
+        {"source_id": str(item["source_id"]), "error": str(item["error"])}
+        for item in source_results
+        if item.get("status") == "error"
+    ]
     ingested_path = workspace / INGESTED_PATH
     preserved_previous_records = False
     if records or not errors or not ingested_path.exists():
@@ -75,25 +103,45 @@ def ingest(manifest_path: Path, workspace: Path) -> dict[str, Any]:
         "record_count": len(records),
         "source_count": len(sources),
         "errors": errors,
+        "source_results": source_results,
+        "failed_source_ids": [str(item["source_id"]) for item in source_results if item.get("status") == "error"],
+        "failed_sources": [item for item in source_results if item.get("status") == "error"],
+        "ok_source_ids": [str(item["source_id"]) for item in source_results if item.get("status") == "ok"],
+        "selected_source_ids": sorted(selected_id_set),
+        "failed_only": failed_only,
         "preserved_previous_records": preserved_previous_records,
         "pack": manifest.get("pack", {}),
     }
     write_json(workspace / SOURCE_REPORT_PATH, report)
+    reporter.done("Ingest", f"records={len(records)} errors={len(errors)}")
     return report
 
 
-def annotate(workspace: Path) -> dict[str, Any]:
+def ingest(
+    manifest_path: Path,
+    workspace: Path,
+    progress: NullProgress | None = None,
+    *,
+    source_ids: list[str] | None = None,
+    failed_only: bool = False,
+) -> dict[str, Any]:
+    return ingest_with_progress(manifest_path, workspace, progress, source_ids=source_ids, failed_only=failed_only)
+
+
+def annotate(workspace: Path, progress: NullProgress | None = None) -> dict[str, Any]:
     ingested = _read_records(workspace / INGESTED_PATH)
     glossary_terms = _glossary_terms(workspace)
     review_entries = _review_entry_map(workspace)
     suggestion_entries = _suggestion_entry_map(workspace)
     auto_annotator = ConsensusAnnotator()
+    reporter = progress or NullProgress()
+    reporter.stage("Annotate", f"{len(ingested)} records")
     annotated_records: list[Record] = []
     generated_review_candidates: dict[str, dict[str, Any]] = {}
     generated_review_candidates_by_category: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
     counts = defaultdict(int)
 
-    for record in ingested:
+    for index, record in enumerate(ingested, start=1):
         review_entry = review_entries.get(record.record_id, {})
         suggestion_entry = suggestion_entries.get(record.record_id, {})
         annotated_text = record.source_text
@@ -154,6 +202,7 @@ def annotate(workspace: Path) -> dict[str, Any]:
             )
         )
         counts[review_status] += 1
+        reporter.meter("Annotate", index, len(ingested), detail=record.record_id, counts=counts)
 
     _write_records(workspace / ANNOTATED_PATH, annotated_records)
     write_json(
@@ -176,11 +225,17 @@ def annotate(workspace: Path) -> dict[str, Any]:
         "record_count": len(annotated_records),
         "status_counts": dict(sorted(counts.items())),
     }
+    reporter.done(
+        "Annotate",
+        " ".join([f"records={len(annotated_records)}"] + [f"{key}={value}" for key, value in sorted(counts.items())]),
+    )
     return summary
 
 
-def report(workspace: Path) -> dict[str, Any]:
+def report(workspace: Path, progress: NullProgress | None = None) -> dict[str, Any]:
     records = _read_records(workspace / ANNOTATED_PATH)
+    reporter = progress or NullProgress()
+    reporter.stage("Report", f"{len(records)} records")
     review_candidates_payload = read_json(workspace / GENERATED_REVIEW_PATH, default={"candidate_count": 0, "candidates": {}})
     review_by_category_payload = read_json(
         workspace / GENERATED_REVIEW_BY_CATEGORY_PATH,
@@ -205,6 +260,10 @@ def report(workspace: Path) -> dict[str, Any]:
     }
     write_json(workspace / REVIEW_REPORT_PATH, report_payload)
     write_json(workspace / GENERATED_REVIEW_REPORT_PATH, report_payload)
+    reporter.done(
+        "Report",
+        f"pending={report_payload['pending_count']} review={report_payload['review_candidate_count']} issues={report_payload['issue_count']}",
+    )
     return report_payload
 
 
@@ -239,11 +298,14 @@ def build(
     *,
     include_generated: bool | None = None,
     include_pending: bool | None = None,
+    progress: NullProgress | None = None,
 ) -> dict[str, Any]:
     annotated_path = workspace / ANNOTATED_PATH
     if not annotated_path.exists():
         raise FileNotFoundError(f"annotated records not found at {annotated_path}")
     records = _read_records(annotated_path)
+    reporter = progress or NullProgress()
+    reporter.stage("Build", manifest_path.name)
     resolved_include_generated = resolve_include_generated(manifest_path, include_generated)
     resolved_include_pending = resolve_include_pending(manifest_path, include_pending)
 
@@ -266,7 +328,8 @@ def build(
         grouped[record.namespace][record.key] = record.annotated_text
 
     written_files: list[str] = []
-    for namespace, mapping in grouped.items():
+    for index, (namespace, mapping) in enumerate(sorted(grouped.items()), start=1):
+        reporter.item("NAMESPACE", index, len(grouped), namespace, f"entries={len(mapping)}")
         path = output_root / "assets" / namespace / "lang" / "ja_jp.json"
         write_json(path, mapping)
         written_files.append(str(path.relative_to(workspace)))
@@ -278,6 +341,7 @@ def build(
         "include_pending": resolved_include_pending,
     }
     write_json(workspace / "build" / "reports" / "build_report.json", build_summary)
+    reporter.done("Build", f"namespaces={len(grouped)} files={len(written_files)}")
     return build_summary
 
 
@@ -287,17 +351,29 @@ def run(
     *,
     include_generated: bool | None = None,
     include_pending: bool | None = None,
+    progress: NullProgress | None = None,
+    source_ids: list[str] | None = None,
+    failed_only: bool = False,
 ) -> dict[str, Any]:
-    ingest_summary = ingest(manifest_path, workspace)
-    annotate_summary = annotate(workspace)
-    review_summary = report(workspace)
+    reporter = progress or NullProgress()
+    reporter.stage("Run", manifest_path.name)
+    ingest_summary = ingest(
+        manifest_path,
+        workspace,
+        progress=reporter,
+        source_ids=source_ids,
+        failed_only=failed_only,
+    )
+    annotate_summary = annotate(workspace, progress=reporter)
+    review_summary = report(workspace, progress=reporter)
     build_summary = build(
         manifest_path,
         workspace,
         include_generated=include_generated,
         include_pending=include_pending,
+        progress=reporter,
     )
-    return {
+    summary = {
         "ingest": ingest_summary,
         "annotate": annotate_summary,
         "report": {
@@ -306,3 +382,5 @@ def run(
         },
         "build": build_summary,
     }
+    reporter.done("Run", f"manifest={manifest_path.name}")
+    return summary

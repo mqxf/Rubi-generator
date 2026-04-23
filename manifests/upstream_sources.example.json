@@ -1,0 +1,24 @@
+{
+  "sources": [
+    {
+      "id": "example-local-upstream-repo",
+      "type": "local_dir",
+      "path": "../gto_repos/ExampleMod",
+      "include_globs": [
+        "src/main/resources/assets/*/lang/ja_jp.json",
+        "**/assets/*/lang/ja_jp.json"
+      ]
+    },
+    {
+      "id": "example-remote-upstream-repo",
+      "type": "github_repo_archive",
+      "owner": "ExampleOwner",
+      "repo": "ExampleMod",
+      "ref": "main",
+      "include_globs": [
+        "src/main/resources/assets/*/lang/ja_jp.json",
+        "**/assets/*/lang/ja_jp.json"
+      ]
+    }
+  ]
+}

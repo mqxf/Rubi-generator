@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from rubi_gto.pipeline import INGESTED_PATH, build, ingest, report, run
+from rubi_gto.pipeline import INGESTED_PATH, SOURCE_REPORT_PATH, build, ingest, report, run
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -12,6 +12,83 @@ def _write_json(path: Path, payload: object) -> None:
 
 
 class PipelineTests(unittest.TestCase):
+    def test_ingest_can_filter_by_source_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            source_a = tmp_path / "fixtures_a"
+            source_b = tmp_path / "fixtures_b"
+            _write_json(source_a / "assets" / "minecraft" / "lang" / "ja_jp.json", {"menu.a": "設定"})
+            _write_json(source_b / "assets" / "minecraft" / "lang" / "ja_jp.json", {"menu.b": "冒険"})
+            _write_json(
+                tmp_path / "manifest.json",
+                {
+                    "pack": {"description": "test pack", "pack_format": 34},
+                    "sources": [
+                        {
+                            "id": "source-a",
+                            "type": "local_dir",
+                            "path": str(source_a),
+                            "include_globs": ["**/assets/*/lang/ja_jp.json"],
+                        },
+                        {
+                            "id": "source-b",
+                            "type": "local_dir",
+                            "path": str(source_b),
+                            "include_globs": ["**/assets/*/lang/ja_jp.json"],
+                        },
+                    ],
+                },
+            )
+
+            summary = ingest(tmp_path / "manifest.json", tmp_path, source_ids=["source-b"])
+            ingested = json.loads((tmp_path / INGESTED_PATH).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["selected_source_ids"], ["source-b"])
+            self.assertEqual(summary["source_count"], 1)
+            self.assertEqual(summary["record_count"], 1)
+            self.assertEqual(ingested[0]["key"], "menu.b")
+
+    def test_ingest_can_rerun_failed_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            source_a = tmp_path / "fixtures_a"
+            source_b = tmp_path / "fixtures_b"
+            _write_json(source_a / "assets" / "minecraft" / "lang" / "ja_jp.json", {"menu.a": "設定"})
+            _write_json(source_b / "assets" / "minecraft" / "lang" / "ja_jp.json", {"menu.b": "冒険"})
+            _write_json(
+                tmp_path / SOURCE_REPORT_PATH,
+                {
+                    "failed_source_ids": ["source-b"],
+                },
+            )
+            _write_json(
+                tmp_path / "manifest.json",
+                {
+                    "pack": {"description": "test pack", "pack_format": 34},
+                    "sources": [
+                        {
+                            "id": "source-a",
+                            "type": "local_dir",
+                            "path": str(source_a),
+                            "include_globs": ["**/assets/*/lang/ja_jp.json"],
+                        },
+                        {
+                            "id": "source-b",
+                            "type": "local_dir",
+                            "path": str(source_b),
+                            "include_globs": ["**/assets/*/lang/ja_jp.json"],
+                        },
+                    ],
+                },
+            )
+
+            summary = ingest(tmp_path / "manifest.json", tmp_path, failed_only=True)
+            ingested = json.loads((tmp_path / INGESTED_PATH).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["selected_source_ids"], ["source-b"])
+            self.assertEqual(summary["record_count"], 1)
+            self.assertEqual(ingested[0]["key"], "menu.b")
+
     def test_ingest_preserves_previous_records_on_total_source_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             tmp_path = Path(temp_dir)

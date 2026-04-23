@@ -14,6 +14,7 @@ from .annotator import validate_annotation
 from .io_utils import read_json, write_json
 from .japanese import apply_reading_conflict_choices, extract_reading_conflicts
 from .annotator import strip_rubi
+from .progress import NullProgress
 
 
 GENERATED_REVIEW_PATH = Path("review/generated/review_candidates.json")
@@ -552,10 +553,13 @@ def llm_review(
     base_url: str | None = None,
     max_output_tokens: int = 1200,
     client: StructuredResponseClient | None = None,
+    progress: NullProgress | None = None,
 ) -> dict[str, Any]:
     candidates = _load_review_candidates(workspace)
     selected = _selected_candidates(candidates, categories=categories, record_ids=record_ids, limit=limit)
     env_loaded = _load_env_file(workspace / ".env")
+    reporter = progress or NullProgress()
+    reporter.stage("LLM Review", f"{len(selected)}/{len(candidates)} selected")
 
     existing_suggestions = read_json(workspace / GENERATED_LLM_SUGGESTIONS_PATH, default={})
     existing_results_payload = read_json(workspace / GENERATED_LLM_REVIEW_RESULTS_PATH, default={"results": {}})
@@ -565,7 +569,7 @@ def llm_review(
     if selected and resolved_client is None:
         resolved_client = OpenAIResponsesHTTPClient(base_url=base_url)
 
-    for candidate in selected:
+    for index, candidate in enumerate(selected, start=1):
         prompt = _build_input_text(candidate)
         try:
             assert resolved_client is not None
@@ -601,6 +605,7 @@ def llm_review(
                         validation_issues=[],
                     )
                     run_counts["fallback_suggested"] += 1
+                    reporter.meter("LLM", index, len(selected), detail=candidate.record_id, counts=run_counts)
                     continue
                 existing_suggestions.pop(candidate.record_id, None)
                 merged_results[candidate.record_id] = _result_entry(
@@ -613,6 +618,7 @@ def llm_review(
                     validation_issues=[],
                 )
                 run_counts["error"] += 1
+                reporter.meter("LLM", index, len(selected), detail=candidate.record_id, counts=run_counts)
                 continue
 
             if not annotated_text:
@@ -635,6 +641,7 @@ def llm_review(
                         annotated_text=fallback_annotation,
                     )
                     run_counts["fallback_suggested"] += 1
+                    reporter.meter("LLM", index, len(selected), detail=candidate.record_id, counts=run_counts)
                     continue
                 existing_suggestions.pop(candidate.record_id, None)
                 merged_results[candidate.record_id] = _result_entry(
@@ -645,6 +652,7 @@ def llm_review(
                     annotated_text=None,
                 )
                 run_counts["abstained"] += 1
+                reporter.meter("LLM", index, len(selected), detail=candidate.record_id, counts=run_counts)
                 continue
 
             validation_issues = validate_annotation(candidate.source_text, annotated_text)
@@ -670,6 +678,7 @@ def llm_review(
                         validation_issues=validation_issues,
                     )
                     run_counts["fallback_suggested"] += 1
+                    reporter.meter("LLM", index, len(selected), detail=candidate.record_id, counts=run_counts)
                     continue
                 existing_suggestions.pop(candidate.record_id, None)
                 merged_results[candidate.record_id] = _result_entry(
@@ -682,6 +691,7 @@ def llm_review(
                     validation_issues=validation_issues,
                 )
                 run_counts["error"] += 1
+                reporter.meter("LLM", index, len(selected), detail=candidate.record_id, counts=run_counts)
                 continue
 
             existing_suggestions[candidate.record_id] = _suggestion_entry(
@@ -698,6 +708,7 @@ def llm_review(
                 annotated_text=annotated_text,
             )
             run_counts["suggested"] += 1
+            reporter.meter("LLM", index, len(selected), detail=candidate.record_id, counts=run_counts)
         except Exception as exc:
             fallback_error_tokens = (
                 "max_output_tokens",
@@ -731,6 +742,7 @@ def llm_review(
                     error=str(exc),
                 )
                 run_counts["fallback_suggested"] += 1
+                reporter.meter("LLM", index, len(selected), detail=candidate.record_id, counts=run_counts)
                 continue
             existing_suggestions.pop(candidate.record_id, None)
             merged_results[candidate.record_id] = _result_entry(
@@ -742,6 +754,7 @@ def llm_review(
                 error=str(exc),
             )
             run_counts["error"] += 1
+            reporter.meter("LLM", index, len(selected), detail=candidate.record_id, counts=run_counts)
 
     write_json(workspace / GENERATED_LLM_SUGGESTIONS_PATH, existing_suggestions)
     results_payload = {
@@ -756,6 +769,7 @@ def llm_review(
     }
     write_json(workspace / GENERATED_LLM_REVIEW_RESULTS_PATH, results_payload)
     write_json(workspace / GENERATED_LLM_REVIEW_REPORT_PATH, _llm_review_report_payload(results_payload))
+    reporter.done("LLM Review", " ".join(f"{key}={value}" for key, value in sorted(run_counts.items())))
     return {
         "model": model,
         "reasoning_effort": reasoning_effort,
