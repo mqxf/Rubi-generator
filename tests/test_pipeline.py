@@ -359,6 +359,57 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("§^高電圧(こうでんあつ)§^機械(きかい)", guide_text)
             self.assertEqual(patchouli_book["landing_text"], "§^遠心分離機(えんしんぶんりき)")
 
+    def test_pipeline_skips_explicit_non_japanese_patchouli_and_guideme_locale_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            guide_path = (
+                tmp_path
+                / "resourcepacks"
+                / "guidepack"
+                / "assets"
+                / "ae2"
+                / "ae2guide"
+                / "_zh_cn"
+                / "page.md"
+            )
+            guide_path.parent.mkdir(parents=True, exist_ok=True)
+            guide_path.write_text("# 高電圧機械", encoding="utf-8")
+            patchouli_path = (
+                tmp_path
+                / "resourcepacks"
+                / "patchouli_pack"
+                / "assets"
+                / "apotheosis"
+                / "patchouli_books"
+                / "apoth_chronicle"
+                / "zh_cn"
+                / "categories"
+                / "enchanting"
+                / "enchantments.json"
+            )
+            patchouli_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_json(
+                patchouli_path,
+                {
+                    "name": "附魔",
+                    "description": "高電圧機械",
+                },
+            )
+            _write_json(tmp_path / "review" / "glossary.json", {"terms": []})
+            _write_json(tmp_path / "review" / "review_entries.json", {})
+            manifest = build_instance_manifest(
+                tmp_path,
+                pack_description="Instance pack",
+                pack_format=34,
+            )
+            _write_json(tmp_path / "manifest.json", manifest)
+
+            summary = run(tmp_path / "manifest.json", tmp_path, include_generated=True, include_pending=False)
+            annotated = json.loads((tmp_path / "build" / "annotated_records.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["ingest"]["record_count"], 0)
+            self.assertEqual(annotated, [])
+
     def test_full_pack_flattens_portable_openloader_content_into_pack_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             tmp_path = Path(temp_dir)

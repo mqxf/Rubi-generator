@@ -35,6 +35,7 @@ GENERATED_REVIEW_BY_CATEGORY_PATH = Path("review/generated/review_candidates_by_
 GENERATED_REVIEW_REPORT_PATH = Path("review/generated/review_report.json")
 GENERATED_LLM_SUGGESTIONS_PATH = Path("review/generated/llm_suggestions.json")
 GENERATED_LLM_REVIEW_RESULTS_PATH = Path("review/generated/llm_review_results.json")
+GENERATED_MANUAL_FIX_SUGGESTIONS_PATH = Path("review/generated/manual_fix_suggestions.json")
 
 
 def _review_entry_map(workspace: Path) -> dict[str, dict[str, Any]]:
@@ -43,8 +44,9 @@ def _review_entry_map(workspace: Path) -> dict[str, dict[str, Any]]:
 
 def _suggestion_entry_map(workspace: Path) -> dict[str, dict[str, Any]]:
     generated = read_json(workspace / GENERATED_LLM_SUGGESTIONS_PATH, default={})
+    manual_fix_generated = read_json(workspace / GENERATED_MANUAL_FIX_SUGGESTIONS_PATH, default={})
     manual = read_json(workspace / "review" / "suggestions.json", default={})
-    return {**generated, **manual}
+    return {**generated, **manual_fix_generated, **manual}
 
 
 def _glossary_terms(workspace: Path) -> list[dict[str, str]]:

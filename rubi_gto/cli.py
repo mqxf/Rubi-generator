@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .llm_review import llm_review
+from .manual_fixes import apply_manual_fix_overrides, export_manual_fix_candidates
 from .pipeline import annotate, build, ingest, report, run
 from .progress import ConsoleProgress
 from .sources import (
@@ -55,6 +56,23 @@ def _parser() -> argparse.ArgumentParser:
     llm_review_command.add_argument("--record-id", dest="record_ids", action="append")
     llm_review_command.add_argument("--max-rate-limit-retries", type=int, default=4)
     llm_review_command.add_argument("--min-request-interval-seconds", type=float, default=0.0)
+    llm_review_command.add_argument("--request-timeout-seconds", type=float, default=20.0)
+
+    export_manual = subparsers.add_parser("export-manual-fixes")
+    export_manual.add_argument("--workspace", type=Path, default=Path("."))
+
+    merge_manual = subparsers.add_parser("merge-manual-fixes")
+    merge_manual.add_argument("--manifest", type=Path, required=True)
+    merge_manual.add_argument("--workspace", type=Path, default=Path("."))
+    merge_manual.add_argument("--fixes", type=Path)
+    merge_manual.add_argument("--export-mode", choices=["overwrite", "full-pack", "both"], default="both")
+    merge_manual.add_argument("--export-locale", default="ja_rubi")
+    include_group = merge_manual.add_mutually_exclusive_group()
+    include_group.add_argument("--include-generated", dest="include_generated", action="store_true", default=True)
+    include_group.add_argument("--approved-only", dest="include_generated", action="store_false")
+    pending_group = merge_manual.add_mutually_exclusive_group()
+    pending_group.add_argument("--include-pending", dest="include_pending", action="store_true", default=True)
+    pending_group.add_argument("--exclude-pending", dest="include_pending", action="store_false")
 
     discover = subparsers.add_parser("discover-local")
     discover.add_argument("--search-root", type=Path, required=True)
@@ -170,6 +188,20 @@ def main(argv: list[str] | None = None) -> int:
             max_output_tokens=args.max_output_tokens,
             max_rate_limit_retries=args.max_rate_limit_retries,
             min_request_interval_seconds=args.min_request_interval_seconds,
+            request_timeout_seconds=args.request_timeout_seconds,
+            progress=progress,
+        )
+    elif args.command == "export-manual-fixes":
+        payload = export_manual_fix_candidates(workspace, progress=progress)
+    elif args.command == "merge-manual-fixes":
+        payload = apply_manual_fix_overrides(
+            workspace,
+            manifest_path=args.manifest.resolve(),
+            fixes_path=args.fixes.resolve() if args.fixes else None,
+            export_mode=args.export_mode,
+            export_locale=args.export_locale,
+            include_generated=args.include_generated,
+            include_pending=args.include_pending,
             progress=progress,
         )
     elif args.command == "build":

@@ -18,6 +18,8 @@ Usage:
   ./scripts/rubi.sh rerun-failed [manifest]
   ./scripts/rubi.sh conflicts
   ./scripts/rubi.sh llm [llm-review args...]
+  ./scripts/rubi.sh export-manual-fixes
+  ./scripts/rubi.sh merge-manual-fixes [manifest] [fixes]
   ./scripts/rubi.sh merge [manifest]
   ./scripts/rubi.sh final [manifest]
   ./scripts/rubi.sh discover-local [search_root] [output]
@@ -82,6 +84,19 @@ llm_stage() {
   else
     python3 -m rubi_gto llm-review --workspace "$WORKSPACE" "$@"
   fi
+}
+
+export_manual_fixes_stage() {
+  python3 -m rubi_gto export-manual-fixes --workspace "$WORKSPACE"
+}
+
+merge_manual_fixes_stage() {
+  local manifest="${1:-$DEFAULT_MANIFEST}"
+  local fixes="${2:-review/generated/manual_fix_overrides.json}"
+  python3 -m rubi_gto merge-manual-fixes \
+    --manifest "$manifest" \
+    --workspace "$WORKSPACE" \
+    --fixes "$fixes"
 }
 
 merge_stage() {
@@ -164,6 +179,12 @@ case "$command" in
     ;;
   llm)
     llm_stage "$@"
+    ;;
+  export-manual-fixes)
+    export_manual_fixes_stage
+    ;;
+  merge-manual-fixes)
+    merge_manual_fixes_stage "$@"
     ;;
   merge)
     merge_stage "$@"

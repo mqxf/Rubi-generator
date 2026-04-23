@@ -260,7 +260,7 @@ class LLMReviewTests(unittest.TestCase):
                 "§^襲撃隊(しゅうげきたい)の§^大将(たいしょう)を§^倒(たお)す。\n§^当分(とうぶん)の§^間(あいだ)§^村(むら)から§^離れ(はなれ)て§^過(す)ごされてみてはいかがでしょうか…",
             )
 
-    def test_llm_review_falls_back_to_deterministic_option_on_abstain(self) -> None:
+    def test_llm_review_falls_back_to_non_sudachi_option_on_abstain(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             tmp_path = Path(temp_dir)
             _write_json(
@@ -307,13 +307,65 @@ class LLMReviewTests(unittest.TestCase):
             results = json.loads((tmp_path / GENERATED_LLM_REVIEW_RESULTS_PATH).read_text(encoding="utf-8"))
 
             self.assertEqual(summary["status_counts"], {"fallback_suggested": 1})
-            self.assertIn(
+            self.assertEqual(
                 suggestions["minecraft:adv.trade"]["annotated_text"],
+                "§^村(そん)§^人(じん)と§^取引(とりひき)をする",
+            )
+            self.assertEqual(results["results"]["minecraft:adv.trade"]["option_choice"], "a")
+            self.assertEqual(results["results"]["minecraft:adv.trade"]["status"], "fallback_suggested")
+
+    def test_llm_review_falls_back_to_sudachi_when_other_option_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            _write_json(
+                tmp_path / "review" / "generated" / "review_candidates.json",
                 {
-                    "§^村(そん)§^人(じん)と§^取引(とりひき)をする",
-                    "§^村人(むらびと)と§^取引(とりひき)をする",
+                    "candidate_count": 1,
+                    "candidates": {
+                        "minecraft:adv.trade": {
+                            "id": "minecraft:adv.trade",
+                            "namespace": "minecraft",
+                            "key": "adv.trade",
+                            "category": "compound_or_lexical_conflict",
+                            "source_text": "村人と取引をする",
+                            "current_text": "村人と取引をする",
+                            "reason": "analyzer_conflict",
+                            "options": [
+                                {
+                                    "source": "fugashi+unidic",
+                                    "annotated_text": "§^村(そん)§^人(じん)で§^取引(とりひき)をする",
+                                },
+                                {
+                                    "source": "sudachi-full",
+                                    "annotated_text": "§^村人(むらびと)と§^取引(とりひき)をする",
+                                },
+                            ],
+                            "source_origin": "test",
+                        }
+                    },
                 },
             )
+            client = FakeClient(
+                [
+                    {
+                        "resolution_type": "abstain",
+                        "option_choice": "none",
+                        "conflict_choices": [],
+                        "final_annotation": "",
+                    }
+                ]
+            )
+
+            summary = llm_review(tmp_path, model="gpt-4.1-mini", client=client)
+            suggestions = json.loads((tmp_path / GENERATED_LLM_SUGGESTIONS_PATH).read_text(encoding="utf-8"))
+            results = json.loads((tmp_path / GENERATED_LLM_REVIEW_RESULTS_PATH).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status_counts"], {"fallback_suggested": 1})
+            self.assertEqual(
+                suggestions["minecraft:adv.trade"]["annotated_text"],
+                "§^村人(むらびと)と§^取引(とりひき)をする",
+            )
+            self.assertEqual(results["results"]["minecraft:adv.trade"]["option_choice"], "b")
             self.assertEqual(results["results"]["minecraft:adv.trade"]["status"], "fallback_suggested")
 
     def test_manual_suggestions_override_generated_llm_suggestions(self) -> None:
@@ -408,3 +460,61 @@ class LLMReviewTests(unittest.TestCase):
             self.assertEqual(summary["status_counts"], {"suggested": 1})
             self.assertEqual(suggestions["minecraft:adv.trade"]["annotated_text"], "§^村人(むらびと)と§^取引(とりひき)をする")
             mocked_sleep.assert_called_with(0.0)
+
+    def test_llm_review_falls_back_on_arbitrary_client_error(self) -> None:
+        class AlwaysFailClient:
+            def create_structured_response(
+                self,
+                *,
+                model: str,
+                instructions: str,
+                input_text: str,
+                schema_name: str,
+                schema: dict[str, object],
+                reasoning_effort: str | None,
+                max_output_tokens: int,
+            ) -> dict[str, object]:
+                raise RuntimeError("upstream exploded")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            _write_json(
+                tmp_path / "review" / "generated" / "review_candidates.json",
+                {
+                    "candidate_count": 1,
+                    "candidates": {
+                        "minecraft:adv.trade": {
+                            "id": "minecraft:adv.trade",
+                            "namespace": "minecraft",
+                            "key": "adv.trade",
+                            "category": "compound_or_lexical_conflict",
+                            "source_text": "村人と取引をする",
+                            "current_text": "村人と取引をする",
+                            "reason": "analyzer_conflict",
+                            "options": [
+                                {
+                                    "source": "fugashi+unidic",
+                                    "annotated_text": "§^村(そん)§^人(じん)と§^取引(とりひき)をする",
+                                },
+                                {
+                                    "source": "sudachi-full",
+                                    "annotated_text": "§^村人(むらびと)と§^取引(とりひき)をする",
+                                },
+                            ],
+                            "source_origin": "test",
+                        }
+                    },
+                },
+            )
+
+            summary = llm_review(tmp_path, model="gpt-4.1-mini", client=AlwaysFailClient())
+            suggestions = json.loads((tmp_path / GENERATED_LLM_SUGGESTIONS_PATH).read_text(encoding="utf-8"))
+            results = json.loads((tmp_path / GENERATED_LLM_REVIEW_RESULTS_PATH).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status_counts"], {"fallback_suggested": 1})
+            self.assertEqual(
+                suggestions["minecraft:adv.trade"]["annotated_text"],
+                "§^村(そん)§^人(じん)と§^取引(とりひき)をする",
+            )
+            self.assertEqual(results["results"]["minecraft:adv.trade"]["option_choice"], "a")
+            self.assertEqual(results["results"]["minecraft:adv.trade"]["status"], "fallback_suggested")

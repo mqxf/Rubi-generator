@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -137,7 +136,7 @@ class OpenAIResponsesHTTPClient:
         *,
         api_key: str | None = None,
         base_url: str | None = None,
-        timeout: float = 120.0,
+        timeout: float = 20.0,
     ) -> None:
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.base_url = (base_url or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
@@ -439,9 +438,16 @@ def _materialize_option_text(candidate: ReviewCandidate, option_text: str) -> st
     return merged
 
 
-def _deterministic_option_choice(record_id: str) -> str:
-    digest = hashlib.sha256(record_id.encode("utf-8")).digest()
-    return "a" if digest[0] % 2 == 0 else "b"
+def _option_source(candidate: ReviewCandidate, label: str) -> str:
+    option = candidate.option_a if label == "a" else candidate.option_b
+    return str(option.get("source", "")).strip().lower()
+
+
+def _fallback_choice_order(candidate: ReviewCandidate) -> list[str]:
+    labels = ["a", "b"]
+    non_sudachi = [label for label in labels if "sudachi" not in _option_source(candidate, label)]
+    sudachi = [label for label in labels if "sudachi" in _option_source(candidate, label)]
+    return non_sudachi + sudachi
 
 
 def _fallback_annotation(candidate: ReviewCandidate) -> tuple[str | None, str | None]:
@@ -455,8 +461,11 @@ def _fallback_annotation(candidate: ReviewCandidate) -> tuple[str | None, str | 
     if len(valid) == 1:
         choice, annotation = next(iter(valid.items()))
         return annotation, choice
-    chosen = _deterministic_option_choice(candidate.record_id)
-    return valid[chosen], chosen
+    for label in _fallback_choice_order(candidate):
+        if label in valid:
+            return valid[label], label
+    choice, annotation = next(iter(sorted(valid.items())))
+    return annotation, choice
 
 
 def _resolve_candidate_output(candidate: ReviewCandidate, payload: dict[str, Any]) -> tuple[str | None, list[str]]:
@@ -619,6 +628,7 @@ def llm_review(
     max_output_tokens: int = 1200,
     max_rate_limit_retries: int = 4,
     min_request_interval_seconds: float = 0.0,
+    request_timeout_seconds: float = 20.0,
     client: StructuredResponseClient | None = None,
     progress: NullProgress | None = None,
 ) -> dict[str, Any]:
@@ -634,9 +644,10 @@ def llm_review(
     run_counts = Counter()
     resolved_client = client
     if selected and resolved_client is None:
-        resolved_client = OpenAIResponsesHTTPClient(base_url=base_url)
+        resolved_client = OpenAIResponsesHTTPClient(base_url=base_url, timeout=request_timeout_seconds)
 
     for index, candidate in enumerate(selected, start=1):
+        reporter.item("LLM", index, len(selected), candidate.record_id, candidate.category)
         prompt = _build_input_text(candidate)
         try:
             assert resolved_client is not None
@@ -781,16 +792,7 @@ def llm_review(
             run_counts["suggested"] += 1
             reporter.meter("LLM", index, len(selected), detail=candidate.record_id, counts=run_counts)
         except Exception as exc:
-            fallback_error_tokens = (
-                "max_output_tokens",
-                "valid JSON",
-                "structured text output",
-            )
-            fallback_annotation, fallback_choice = (
-                _fallback_annotation(candidate)
-                if any(token in str(exc) for token in fallback_error_tokens)
-                else (None, None)
-            )
+            fallback_annotation, fallback_choice = _fallback_annotation(candidate)
             if fallback_annotation:
                 fallback_payload = {
                     "resolution_type": "pick_option",
@@ -853,4 +855,5 @@ def llm_review(
         "written_report_path": str(GENERATED_LLM_REVIEW_REPORT_PATH),
         "max_rate_limit_retries": max_rate_limit_retries,
         "min_request_interval_seconds": min_request_interval_seconds,
+        "request_timeout_seconds": request_timeout_seconds,
     }

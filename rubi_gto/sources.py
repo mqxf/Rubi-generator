@@ -48,6 +48,7 @@ GUIDE_TEXT_SUFFIXES = {".md", ".txt"}
 PATCHOULI_JSON_SUFFIXES = {".json", ".json5"}
 PATCHOULI_TEXT_SUFFIXES = {".md", ".txt"}
 JAPANESE_TEXT_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff々ヶ]")
+LOCALE_SEGMENT_RE = re.compile(r"^_?[a-z]{2}_[a-z]{2}$")
 FTBQUESTS_TRANSLATABLE_FIELDS = {"title", "subtitle", "description"}
 
 
@@ -133,6 +134,19 @@ def _contains_japanese(text: str) -> bool:
 def _looks_like_japanese_locale_path(path: str) -> bool:
     parts = {part.lower() for part in PurePosixPath(path).parts}
     return "ja_jp" in parts or "_ja_jp" in parts
+
+
+def _explicit_locale_segments(path: str) -> set[str]:
+    return {
+        part.lower()
+        for part in PurePosixPath(path).parts
+        if LOCALE_SEGMENT_RE.match(part.lower())
+    }
+
+
+def _has_explicit_non_japanese_locale_path(path: str) -> bool:
+    locales = _explicit_locale_segments(path)
+    return bool(locales) and not {"ja_jp", "_ja_jp"} & locales
 
 
 def _json_path_to_key(path: tuple[str, ...]) -> str:
@@ -239,6 +253,8 @@ def _text_record(
 ) -> Record | None:
     if not text:
         return None
+    if _has_explicit_non_japanese_locale_path(path):
+        return None
     if not _looks_like_japanese_locale_path(path) and not _contains_japanese(text):
         return None
     namespace = _derive_lang_namespace(path, source.target_namespace or source.id)
@@ -269,6 +285,8 @@ def _records_from_generic_json(
     source_id: str | None = None,
     content_type: str = "json_strings",
 ) -> list[Record]:
+    if _has_explicit_non_japanese_locale_path(path):
+        return []
     namespace = _derive_lang_namespace(path, source.target_namespace or source.id)
     entries = _json_string_entries(payload)
     if not entries:
