@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import copy
 from pathlib import Path
 import shutil
 from typing import Any
 
 from .annotator import apply_glossary, validate_annotation
-from .io_utils import ensure_dir, read_json, write_json
+from .io_utils import ensure_dir, read_json, read_text, write_json, write_text
 from .japanese import ConsensusAnnotator, categorize_review_candidate
 from .models import Record
 from .progress import NullProgress
@@ -23,6 +24,7 @@ ANNOTATED_PATH = Path("build/annotated_records.json")
 SOURCE_REPORT_PATH = Path("build/reports/source_report.json")
 REVIEW_REPORT_PATH = Path("build/reports/review_report.json")
 RESOURCEPACK_PATH = Path("build/resourcepack")
+STAGED_INSTANCE_PATH = Path("build/staged")
 GENERATED_REVIEW_PATH = Path("review/generated/review_candidates.json")
 GENERATED_REVIEW_BY_CATEGORY_PATH = Path("review/generated/review_candidates_by_category.json")
 GENERATED_REVIEW_REPORT_PATH = Path("review/generated/review_report.json")
@@ -199,6 +201,10 @@ def annotate(workspace: Path, progress: NullProgress | None = None) -> dict[str,
                 review_status=review_status,
                 issues=issues,
                 notes=notes,
+                content_type=record.content_type,
+                output_kind=record.output_kind,
+                output_path=record.output_path,
+                metadata=dict(record.metadata),
             )
         )
         counts[review_status] += 1
@@ -278,6 +284,37 @@ def _pack_meta(manifest_path: Path) -> dict[str, Any]:
     }
 
 
+def _build_target_layout(manifest_path: Path) -> str:
+    manifest, _ = load_manifest(manifest_path)
+    return str(manifest.get("build", {}).get("target_layout", "resourcepack"))
+
+
+def _set_nested_value(payload: Any, path: list[str], value: str) -> None:
+    current = payload
+    for part in path[:-1]:
+        if isinstance(current, list):
+            current = current[int(part)]
+        else:
+            current = current[part]
+    last = path[-1]
+    if isinstance(current, list):
+        current[int(last)] = value
+    else:
+        current[last] = value
+
+
+def _write_pack_meta(path: Path, *, description: str, pack_format: int, pack_id: str | None = None) -> None:
+    payload: dict[str, Any] = {
+        "pack": {
+            "description": description,
+            "pack_format": pack_format,
+        }
+    }
+    if pack_id:
+        payload["id"] = pack_id
+    write_json(path / "pack.mcmeta", payload)
+
+
 def resolve_include_generated(manifest_path: Path, include_generated: bool | None) -> bool:
     if include_generated is not None:
         return include_generated
@@ -308,12 +345,12 @@ def build(
     reporter.stage("Build", manifest_path.name)
     resolved_include_generated = resolve_include_generated(manifest_path, include_generated)
     resolved_include_pending = resolve_include_pending(manifest_path, include_pending)
+    target_layout = _build_target_layout(manifest_path)
 
-    output_root = workspace / RESOURCEPACK_PATH
+    output_root = workspace / (STAGED_INSTANCE_PATH if target_layout == "instance" else RESOURCEPACK_PATH)
     if output_root.exists():
         shutil.rmtree(output_root)
     ensure_dir(output_root)
-    write_json(output_root / "pack.mcmeta", _pack_meta(manifest_path))
 
     allowed_statuses = {"approved"}
     if resolved_include_generated:
@@ -321,24 +358,104 @@ def build(
     if resolved_include_pending:
         allowed_statuses.add("pending")
 
+    if target_layout == "instance":
+        manifest_pack = _pack_meta(manifest_path)["pack"]
+        resourcepack_root = output_root / "resourcepack"
+        ensure_dir(resourcepack_root)
+        _write_pack_meta(
+            resourcepack_root,
+            description=str(manifest_pack["description"]),
+            pack_format=int(manifest_pack["pack_format"]),
+        )
+    else:
+        write_json(output_root / "pack.mcmeta", _pack_meta(manifest_path))
+
     grouped: dict[str, dict[str, str]] = defaultdict(dict)
+    grouped_json: dict[tuple[str, str], dict[str, Any]] = {}
+    grouped_text: dict[tuple[str, str], str] = {}
     for record in records:
         if record.review_status not in allowed_statuses:
             continue
-        grouped[record.namespace][record.key] = record.annotated_text
+        if target_layout != "instance":
+            grouped[record.namespace][record.key] = record.annotated_text
+            continue
+        output_path = record.output_path or f"assets/{record.namespace}/lang/ja_jp.json"
+        output_root_key = str(record.metadata.get("output_root", "resourcepack"))
+        if record.content_type == "lang_json":
+            grouped[f"{output_root_key}:{output_path}"][record.key] = record.annotated_text
+        elif record.content_type in {"patchouli_json", "json_strings"}:
+            key = (output_root_key, output_path)
+            if key not in grouped_json:
+                grouped_json[key] = copy.deepcopy(record.metadata.get("template_payload", {}))
+            json_path = list(record.metadata.get("json_path", []))
+            if json_path:
+                _set_nested_value(grouped_json[key], json_path, record.annotated_text)
+        else:
+            grouped_text[(output_root_key, output_path)] = record.annotated_text
 
     written_files: list[str] = []
-    for index, (namespace, mapping) in enumerate(sorted(grouped.items()), start=1):
-        reporter.item("NAMESPACE", index, len(grouped), namespace, f"entries={len(mapping)}")
-        path = output_root / "assets" / namespace / "lang" / "ja_jp.json"
-        write_json(path, mapping)
-        written_files.append(str(path.relative_to(workspace)))
+    written_output_kinds: dict[str, int] = defaultdict(int)
+    if target_layout != "instance":
+        for index, (namespace, mapping) in enumerate(sorted(grouped.items()), start=1):
+            reporter.item("NAMESPACE", index, len(grouped), namespace, f"entries={len(mapping)}")
+            path = output_root / "assets" / namespace / "lang" / "ja_jp.json"
+            write_json(path, mapping)
+            written_files.append(str(path.relative_to(workspace)))
+    else:
+        openloader_roots: set[str] = set()
+        total_files = len(grouped) + len(grouped_json) + len(grouped_text)
+        write_index = 0
+        for compound_key, mapping in sorted(grouped.items()):
+            write_index += 1
+            output_root_key, output_path = compound_key.split(":", 1)
+            reporter.item("FILE", write_index, total_files, output_path, output_root_key)
+            target_path = output_root / output_root_key / output_path
+            write_json(target_path, mapping)
+            written_files.append(str(target_path.relative_to(workspace)))
+            written_output_kinds[output_root_key] += 1
+            if output_root_key.startswith("config/openloader/resources/"):
+                openloader_roots.add(output_root_key)
+        for (output_root_key, output_path), payload in sorted(grouped_json.items()):
+            write_index += 1
+            reporter.item("FILE", write_index, total_files, output_path, output_root_key)
+            target_path = output_root / output_root_key / output_path
+            write_json(target_path, payload)
+            written_files.append(str(target_path.relative_to(workspace)))
+            written_output_kinds[output_root_key] += 1
+            if output_root_key.startswith("config/openloader/resources/"):
+                openloader_roots.add(output_root_key)
+        for (output_root_key, output_path), text in sorted(grouped_text.items()):
+            write_index += 1
+            reporter.item("FILE", write_index, total_files, output_path, output_root_key)
+            target_path = output_root / output_root_key / output_path
+            write_text(target_path, text)
+            written_files.append(str(target_path.relative_to(workspace)))
+            written_output_kinds[output_root_key] += 1
+            if output_root_key.startswith("config/openloader/resources/"):
+                openloader_roots.add(output_root_key)
+        for openloader_root in sorted(openloader_roots):
+            target_root = output_root / openloader_root
+            if not (target_root / "pack.mcmeta").exists():
+                _write_pack_meta(
+                    target_root,
+                    description=f"Rubi GTO generated override for {Path(openloader_root).name}",
+                    pack_format=int(manifest_pack["pack_format"]),
+                    pack_id=Path(openloader_root).name,
+                )
 
     build_summary = {
-        "namespace_count": len(grouped),
+        "namespace_count": len(grouped) if target_layout != "instance" else len(
+            {
+                record.namespace
+                for record in records
+                if record.review_status in allowed_statuses
+            }
+        ),
         "written_files": sorted(written_files),
         "include_generated": resolved_include_generated,
         "include_pending": resolved_include_pending,
+        "target_layout": target_layout,
+        "written_output_kinds": dict(sorted(written_output_kinds.items())),
     }
     write_json(workspace / "build" / "reports" / "build_report.json", build_summary)
     reporter.done("Build", f"namespaces={len(grouped)} files={len(written_files)}")

@@ -8,6 +8,7 @@ from .llm_review import llm_review
 from .pipeline import annotate, build, ingest, report, run
 from .progress import ConsoleProgress
 from .sources import (
+    build_instance_manifest,
     build_instance_content_report,
     build_local_manifest,
     build_mod_archive_manifest,
@@ -85,6 +86,21 @@ def _parser() -> argparse.ArgumentParser:
     discover_instance.add_argument("--include-vanilla", action="store_true")
     discover_instance.add_argument("--minecraft-version", default="1.20.1")
     discover_instance.add_argument("--locale", default="ja_jp")
+
+    run_instance = subparsers.add_parser("run-instance")
+    run_instance.add_argument("--instance-root", type=Path, required=True)
+    run_instance.add_argument("--workspace", type=Path, default=Path("."))
+    run_instance.add_argument("--include-vanilla", action="store_true")
+    run_instance.add_argument("--minecraft-version", default="1.20.1")
+    run_instance.add_argument("--locale", default="ja_jp")
+    run_instance.add_argument("--source-id", dest="source_ids", action="append")
+    run_instance.add_argument("--failed-only", action="store_true")
+    include_group = run_instance.add_mutually_exclusive_group()
+    include_group.add_argument("--include-generated", dest="include_generated", action="store_true", default=None)
+    include_group.add_argument("--approved-only", dest="include_generated", action="store_false")
+    pending_group = run_instance.add_mutually_exclusive_group()
+    pending_group.add_argument("--include-pending", dest="include_pending", action="store_true", default=None)
+    pending_group.add_argument("--exclude-pending", dest="include_pending", action="store_false")
 
     return parser
 
@@ -183,6 +199,30 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps(payload["manifest"], ensure_ascii=False, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
+    elif args.command == "run-instance":
+        runtime_manifest = build_instance_manifest(
+            args.instance_root.resolve(),
+            pack_description="Rubi GTO generated Japanese pack",
+            pack_format=34,
+            include_vanilla=args.include_vanilla,
+            minecraft_version=args.minecraft_version,
+            locale=args.locale,
+        )
+        runtime_manifest_path = workspace / "build" / "reports" / "instance_runtime_manifest.json"
+        runtime_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        runtime_manifest_path.write_text(
+            json.dumps(runtime_manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        payload = run(
+            runtime_manifest_path,
+            workspace,
+            include_generated=args.include_generated,
+            include_pending=args.include_pending,
+            progress=progress,
+            source_ids=args.source_ids,
+            failed_only=args.failed_only,
+        )
     else:
         payload = run(
             args.manifest.resolve(),

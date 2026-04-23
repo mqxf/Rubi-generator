@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from rubi_gto.pipeline import INGESTED_PATH, SOURCE_REPORT_PATH, build, ingest, report, run
+from rubi_gto.sources import build_instance_manifest
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -254,6 +255,108 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(summary["annotate"]["status_counts"]["suggested"], 1)
             self.assertEqual(annotated_records[0]["annotated_text"], "§^遠心分離機(えんしんぶんりき)")
             self.assertEqual(annotated_records[0]["notes"], "suggestion:llm")
+
+    def test_pipeline_builds_staged_instance_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            _write_json(
+                tmp_path / "config" / "openloader" / "resources" / "quests" / "pack.mcmeta",
+                {"id": "gto_quests", "pack": {"description": "Quest pack", "pack_format": 34}},
+            )
+            _write_json(
+                tmp_path
+                / "config"
+                / "openloader"
+                / "resources"
+                / "quests"
+                / "assets"
+                / "gto"
+                / "lang"
+                / "ja_jp.json",
+                {"gto.quest.title": "高電圧機械"},
+            )
+            guide_path = (
+                tmp_path
+                / "resourcepacks"
+                / "guidepack"
+                / "assets"
+                / "ae2"
+                / "ae2guide"
+                / "_ja_jp"
+                / "page.md"
+            )
+            guide_path.parent.mkdir(parents=True, exist_ok=True)
+            guide_path.write_text("# 高電圧機械", encoding="utf-8")
+            patchouli_root = tmp_path / "patchouli_books" / "testbook"
+            patchouli_root.mkdir(parents=True, exist_ok=True)
+            _write_json(
+                patchouli_root / "book.json",
+                {
+                    "name": "高電圧機械",
+                    "landing_text": "遠心分離機",
+                },
+            )
+            _write_json(
+                tmp_path / "review" / "glossary.json",
+                {
+                    "terms": [
+                        {"plain": "高電圧", "annotated": "§^高電圧(こうでんあつ)"},
+                        {"plain": "機械", "annotated": "§^機械(きかい)"},
+                        {"plain": "遠心分離機", "annotated": "§^遠心分離機(えんしんぶんりき)"},
+                    ]
+                },
+            )
+            _write_json(tmp_path / "review" / "review_entries.json", {})
+            manifest = build_instance_manifest(
+                tmp_path,
+                pack_description="Instance pack",
+                pack_format=34,
+            )
+            _write_json(tmp_path / "manifest.json", manifest)
+
+            summary = run(tmp_path / "manifest.json", tmp_path, include_generated=True, include_pending=False)
+
+            openloader_lang = json.loads(
+                (
+                    tmp_path
+                    / "build"
+                    / "staged"
+                    / "config"
+                    / "openloader"
+                    / "resources"
+                    / "gto_quests"
+                    / "assets"
+                    / "gto"
+                    / "lang"
+                    / "ja_jp.json"
+                ).read_text(encoding="utf-8")
+            )
+            guide_text = (
+                tmp_path
+                / "build"
+                / "staged"
+                / "resourcepack"
+                / "assets"
+                / "ae2"
+                / "ae2guide"
+                / "_ja_jp"
+                / "page.md"
+            ).read_text(encoding="utf-8")
+            patchouli_book = json.loads(
+                (
+                    tmp_path
+                    / "build"
+                    / "staged"
+                    / "patchouli_books"
+                    / "testbook"
+                    / "book.json"
+                ).read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(summary["build"]["target_layout"], "instance")
+            self.assertEqual(openloader_lang["gto.quest.title"], "§^高電圧(こうでんあつ)§^機械(きかい)")
+            self.assertIn("§^高電圧(こうでんあつ)§^機械(きかい)", guide_text)
+            self.assertEqual(patchouli_book["landing_text"], "§^遠心分離機(えんしんぶんりき)")
 
     def test_build_uses_manifest_default_for_generated_entries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

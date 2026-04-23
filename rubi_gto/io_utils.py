@@ -21,3 +21,14 @@ def write_json(path: Path, payload: Any) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
         handle.write("\n")
+
+
+def read_text(path: Path, default: str = "") -> str:
+    if not path.exists():
+        return default
+    return path.read_text(encoding="utf-8")
+
+
+def write_text(path: Path, payload: str) -> None:
+    ensure_dir(path.parent)
+    path.write_text(payload, encoding="utf-8")

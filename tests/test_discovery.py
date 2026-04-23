@@ -7,6 +7,7 @@ from pathlib import Path
 from rubi_gto.models import SourceSpec
 from rubi_gto.sources import (
     build_instance_content_report,
+    build_instance_manifest,
     build_local_manifest,
     build_mod_archive_manifest,
     build_packwiz_translation_report,
@@ -286,4 +287,43 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual(report["patchouli_external_books"]["book_count"], 1)
             self.assertEqual(len(report["guide_sources"]), 1)
             self.assertEqual(report["manifest"]["sources"][0]["type"], "minecraft_assets")
-            self.assertEqual(len(report["manifest"]["sources"]), 3)
+            self.assertEqual(len(report["manifest"]["sources"]), 5)
+            self.assertEqual(report["source_count"], 5)
+
+    def test_builds_instance_manifest_with_staged_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            instance_root = Path(temp_dir)
+            _write_archive(
+                instance_root / "mods" / "ExampleMod-1.0.0.jar",
+                mods_toml='[[mods]]\nmodId = "examplemod"\n',
+                files={"assets/examplemod/lang/ja_jp.json": json.dumps({"gui.title": "例"})},
+            )
+            _write_json(
+                instance_root / "config" / "openloader" / "resources" / "quests" / "pack.mcmeta",
+                {"id": "gto_quests", "pack": {"description": "Quest pack", "pack_format": 34}},
+            )
+            _write_json(
+                instance_root
+                / "config"
+                / "openloader"
+                / "resources"
+                / "quests"
+                / "assets"
+                / "gto"
+                / "lang"
+                / "ja_jp.json",
+                {"gto.quest.title": "冒険"},
+            )
+            manifest = build_instance_manifest(
+                instance_root,
+                pack_description="Instance pack",
+                pack_format=34,
+                include_vanilla=True,
+            )
+
+            self.assertEqual(manifest["build"]["target_layout"], "instance")
+            self.assertEqual(manifest["sources"][0]["type"], "minecraft_assets")
+            self.assertEqual(manifest["sources"][1]["output_root"], "resourcepack")
+            self.assertTrue(
+                any(source["output_kind"] == "openloader" for source in manifest["sources"][1:])
+            )

@@ -2,7 +2,15 @@
 
 ## First stage
 
-Build the first pass from source files:
+Build the first pass from a fully installed instance:
+
+```bash
+./scripts/rubi.sh run-instance /path/to/instance
+```
+
+This scans local `mods/`, `config/openloader/resources/`, `resourcepacks/`, and `patchouli_books/`, then writes staged outputs under `build/staged/`.
+
+Build the first pass from an explicit manifest:
 
 ```bash
 ./scripts/rubi.sh first
@@ -167,3 +175,9 @@ Defaults:
 - instance root: `../gto_repos/GregTech-Odyssey`
 - report: `build/reports/instance_content_report.json`
 - manifest: `build/reports/instance_sources.json`
+
+Run the full instance pipeline without creating a manual manifest:
+
+```bash
+python3 -m rubi_gto run-instance --instance-root ../gto_repos/GregTech-Odyssey --workspace .
+```

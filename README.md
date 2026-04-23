@@ -37,6 +37,19 @@ Run the full pipeline:
 python3 -m rubi_gto run --manifest manifests/gto_sources.json --workspace .
 ```
 
+Run directly from a fully installed instance without preparing a manifest:
+
+```bash
+python3 -m rubi_gto run-instance --instance-root /path/to/instance --workspace .
+```
+
+This scans `mods/`, `config/openloader/resources/`, `resourcepacks/`, and `patchouli_books/`, then writes staged outputs under `build/staged/`.
+The staged tree mirrors the real install layout:
+
+- `build/staged/resourcepack/...`
+- `build/staged/config/openloader/resources/<pack>/...`
+- `build/staged/patchouli_books/<book>/...`
+
 Run a smaller first pass using only vanilla Minecraft `1.20.1`:
 
 ```bash
@@ -156,7 +169,7 @@ python3 -m rubi_gto run --manifest build/reports/gto_mod_archives.json --workspa
 Scan a whole Minecraft instance folder and emit:
 
 - a content report for mod jars, OpenLoader packs, FTB Quests roots, GuideME pages, and Patchouli books
-- a runnable manifest for every `ja_jp` source found in that instance
+- a runnable manifest for every supported local source found in that instance
 
 ```bash
 python3 -m rubi_gto discover-instance \
@@ -164,6 +177,8 @@ python3 -m rubi_gto discover-instance \
   --output build/reports/instance_content_report.json \
   --manifest-output build/reports/instance_sources.json
 ```
+
+The generated instance manifest uses staged instance output mode, so `build` writes mirrored override paths instead of only `build/resourcepack/assets/...`.
 
 The instance report includes override targets for:
 

@@ -39,6 +39,10 @@ DEFAULT_PATCHOULI_ASSET_INCLUDE_GLOBS = ["assets/*/patchouli_books/**"]
 DEFAULT_PATCHOULI_DATA_INCLUDE_GLOBS = ["data/*/patchouli_books/**"]
 FTBQUESTS_DIR_NAMES = {"ftbquests", "ftb_quests"}
 FTBQUESTS_ROOT_NAMES = {"quests", "normal"}
+GUIDE_TEXT_SUFFIXES = {".md", ".txt"}
+PATCHOULI_JSON_SUFFIXES = {".json", ".json5"}
+PATCHOULI_TEXT_SUFFIXES = {".md", ".txt"}
+JAPANESE_TEXT_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff々ヶ]")
 
 
 def load_manifest(manifest_path: Path) -> tuple[dict[str, Any], list[SourceSpec]]:
@@ -88,19 +92,17 @@ def _minecraft_asset_url(asset_hash: str) -> str:
     return f"https://resources.download.minecraft.net/{asset_hash[:2]}/{asset_hash}"
 
 
-def _flatten_strings(payload: Any, prefix: str = "") -> dict[str, str]:
-    flattened: dict[str, str] = {}
+def _json_string_entries(payload: Any, path: tuple[str, ...] = ()) -> list[tuple[tuple[str, ...], str]]:
+    entries: list[tuple[tuple[str, ...], str]] = []
     if isinstance(payload, dict):
         for key, value in payload.items():
-            next_prefix = f"{prefix}.{key}" if prefix else key
-            flattened.update(_flatten_strings(value, next_prefix))
+            entries.extend(_json_string_entries(value, path + (str(key),)))
     elif isinstance(payload, list):
         for index, value in enumerate(payload):
-            next_prefix = f"{prefix}.{index}" if prefix else str(index)
-            flattened.update(_flatten_strings(value, next_prefix))
-    elif isinstance(payload, str) and prefix:
-        flattened[prefix] = payload
-    return flattened
+            entries.extend(_json_string_entries(value, path + (str(index),)))
+    elif isinstance(payload, str) and path:
+        entries.append((path, payload))
+    return entries
 
 
 def _derive_lang_namespace(path: str, fallback: str | None) -> str:
@@ -109,9 +111,63 @@ def _derive_lang_namespace(path: str, fallback: str | None) -> str:
         index = parts.index("assets")
         if index + 1 < len(parts):
             return parts[index + 1]
+    if "data" in parts:
+        index = parts.index("data")
+        if index + 1 < len(parts):
+            return parts[index + 1]
     if fallback:
         return fallback
     raise ValueError(f"could not derive namespace from path {path}")
+
+
+def _contains_japanese(text: str) -> bool:
+    return bool(JAPANESE_TEXT_RE.search(text))
+
+
+def _looks_like_japanese_locale_path(path: str) -> bool:
+    parts = {part.lower() for part in PurePosixPath(path).parts}
+    return "ja_jp" in parts or "_ja_jp" in parts
+
+
+def _json_path_to_key(path: tuple[str, ...]) -> str:
+    return ".".join(path)
+
+
+def _set_nested_value(payload: Any, path: tuple[str, ...], value: str) -> None:
+    current = payload
+    for part in path[:-1]:
+        if isinstance(current, list):
+            current = current[int(part)]
+        else:
+            current = current[part]
+    last = path[-1]
+    if isinstance(current, list):
+        current[int(last)] = value
+    else:
+        current[last] = value
+
+
+def _record_metadata(
+    *,
+    source: SourceSpec,
+    output_path: str,
+    template_payload: Any | None = None,
+    json_path: tuple[str, ...] | None = None,
+    source_path: str,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "output_root": source.output_root or "resourcepack",
+        "source_path": source_path,
+    }
+    if source.output_kind != "resourcepack":
+        metadata["pack_meta"] = {
+            "pack_id": source.id,
+        }
+    if template_payload is not None:
+        metadata["template_payload"] = template_payload
+    if json_path is not None:
+        metadata["json_path"] = list(json_path)
+    return metadata
 
 
 def _path_matches(path: str, include_globs: list[str]) -> bool:
@@ -143,7 +199,7 @@ def _records_from_json(
             raise ValueError(f"source {source.id} expected a JSON object at {path}")
         items = {key: value for key, value in payload.items() if isinstance(value, str)}
     else:
-        items = _flatten_strings(payload)
+        items = { _json_path_to_key(json_path): value for json_path, value in _json_string_entries(payload)}
     return [
         Record(
             namespace=namespace,
@@ -152,9 +208,89 @@ def _records_from_json(
             annotated_text=value,
             source_origin=f"{origin}:{path}",
             source_id=source_id or source.id,
+            output_kind=source.output_kind,
+            output_path=f"assets/{namespace}/lang/{source.locale or 'ja_jp'}.json" if source.json_mode == "lang" else None,
+            metadata=_record_metadata(
+                source=source,
+                output_path=f"assets/{namespace}/lang/{source.locale or 'ja_jp'}.json" if source.json_mode == "lang" else path,
+                source_path=path,
+            ),
         )
         for key, value in items.items()
     ]
+
+
+def _text_record(
+    *,
+    source: SourceSpec,
+    origin: str,
+    path: str,
+    text: str,
+    output_path: str,
+    source_id: str | None = None,
+    content_type: str = "text_file",
+) -> Record | None:
+    if not text:
+        return None
+    if not _looks_like_japanese_locale_path(path) and not _contains_japanese(text):
+        return None
+    namespace = _derive_lang_namespace(path, source.target_namespace or source.id)
+    return Record(
+        namespace=namespace,
+        key=path,
+        source_text=text,
+        annotated_text=text,
+        source_origin=f"{origin}:{path}",
+        source_id=source_id or source.id,
+        content_type=content_type,
+        output_kind=source.output_kind,
+        output_path=output_path,
+        metadata=_record_metadata(source=source, output_path=output_path, source_path=path),
+    )
+
+
+def _records_from_generic_json(
+    *,
+    source: SourceSpec,
+    origin: str,
+    path: str,
+    payload: Any,
+    output_path: str,
+    source_id: str | None = None,
+    content_type: str = "json_strings",
+) -> list[Record]:
+    namespace = _derive_lang_namespace(path, source.target_namespace or source.id)
+    entries = _json_string_entries(payload)
+    if not entries:
+        return []
+    include_all = _looks_like_japanese_locale_path(path)
+    if not include_all and not any(_contains_japanese(value) for _, value in entries):
+        return []
+    records: list[Record] = []
+    for json_path, value in entries:
+        if not include_all and not _contains_japanese(value):
+            continue
+        records.append(
+            Record(
+                namespace=namespace,
+                key=f"{path}::{_json_path_to_key(json_path)}",
+                source_text=value,
+                annotated_text=value,
+                source_origin=f"{origin}:{path}",
+                source_id=source_id or source.id,
+                content_type=content_type,
+                output_kind=source.output_kind,
+                output_path=output_path,
+                metadata=_record_metadata(
+                    source=source,
+                    output_path=output_path,
+                    template_payload=payload,
+                    json_path=json_path,
+                    source_path=path,
+                ),
+            )
+        )
+    return records
 
 
 def _iter_archive_paths(root: Path) -> list[Path]:
@@ -475,6 +611,135 @@ def _ingest_local_dir(source: SourceSpec, *, progress: NullProgress | None = Non
     return records
 
 
+def _instance_output_path_for_member(path: str) -> str:
+    return path
+
+
+def _ingest_instance_payload(
+    *,
+    source: SourceSpec,
+    origin: str,
+    path: str,
+    payload: bytes | str,
+    source_id: str | None = None,
+) -> list[Record]:
+    suffix = PurePosixPath(path).suffix.lower()
+    output_path = _instance_output_path_for_member(path)
+    if "assets/" in path and "/lang/" in path and suffix == ".json":
+        json_payload = json.loads(payload if isinstance(payload, str) else payload.decode("utf-8"))
+        return _records_from_json(
+            source=source,
+            origin=origin,
+            path=path,
+            payload=json_payload,
+            source_id=source_id,
+        )
+    if "/ae2guide/" in path and suffix in GUIDE_TEXT_SUFFIXES:
+        text = payload if isinstance(payload, str) else payload.decode("utf-8")
+        record = _text_record(
+            source=source,
+            origin=origin,
+            path=path,
+            text=text,
+            output_path=output_path,
+            source_id=source_id,
+            content_type="guide_text",
+        )
+        return [record] if record else []
+    if ("patchouli_books" in path or source.output_kind == "instance") and suffix in PATCHOULI_JSON_SUFFIXES:
+        json_payload = json.loads(payload if isinstance(payload, str) else payload.decode("utf-8"))
+        return _records_from_generic_json(
+            source=source,
+            origin=origin,
+            path=path,
+            payload=json_payload,
+            output_path=output_path,
+            source_id=source_id,
+            content_type="patchouli_json",
+        )
+    if ("patchouli_books" in path or source.output_kind == "instance") and suffix in PATCHOULI_TEXT_SUFFIXES:
+        text = payload if isinstance(payload, str) else payload.decode("utf-8")
+        record = _text_record(
+            source=source,
+            origin=origin,
+            path=path,
+            text=text,
+            output_path=output_path,
+            source_id=source_id,
+            content_type="patchouli_text",
+        )
+        return [record] if record else []
+    return []
+
+
+def _iter_instance_dir_members(root: Path) -> list[str]:
+    members = set(_dir_matching_members(root, list(DEFAULT_ARCHIVE_INCLUDE_GLOBS), suffixes={".json"}))
+    members.update(_dir_matching_members(root, list(DEFAULT_GUIDEME_INCLUDE_GLOBS)))
+    members.update(_dir_matching_members(root, list(DEFAULT_PATCHOULI_ASSET_INCLUDE_GLOBS)))
+    members.update(_dir_matching_members(root, list(DEFAULT_PATCHOULI_DATA_INCLUDE_GLOBS)))
+    return sorted(members)
+
+
+def _iter_instance_archive_members(archive: zipfile.ZipFile) -> list[str]:
+    members = set(_archive_matching_members(archive, list(DEFAULT_ARCHIVE_INCLUDE_GLOBS), suffixes={".json"}))
+    members.update(_archive_matching_members(archive, list(DEFAULT_GUIDEME_INCLUDE_GLOBS)))
+    members.update(_archive_matching_members(archive, list(DEFAULT_PATCHOULI_ASSET_INCLUDE_GLOBS)))
+    members.update(_archive_matching_members(archive, list(DEFAULT_PATCHOULI_DATA_INCLUDE_GLOBS)))
+    return sorted(members)
+
+
+def _ingest_instance_dir(source: SourceSpec, *, progress: NullProgress | None = None) -> list[Record]:
+    if not source.path:
+        raise ValueError(f"source {source.id} is missing path")
+    root = Path(source.path)
+    members = set(_iter_instance_dir_members(root))
+    if source.output_kind == "instance":
+        for suffix in ("*.json", "*.json5", "*.md", "*.txt"):
+            for path in root.rglob(suffix):
+                if path.is_file():
+                    members.add(path.relative_to(root).as_posix())
+    ordered_members = sorted(members)
+    records: list[Record] = []
+    for index, rel in enumerate(ordered_members, start=1):
+        if progress:
+            progress.item("FILE", index, len(ordered_members), rel, source.id)
+        path = root / rel
+        raw = path.read_text(encoding="utf-8") if path.suffix.lower() in {".json", ".md", ".txt"} else path.read_bytes()
+        records.extend(
+            _ingest_instance_payload(
+                source=source,
+                origin=str(root.resolve()),
+                path=rel,
+                payload=raw,
+            )
+        )
+    return records
+
+
+def _ingest_instance_archive(source: SourceSpec, *, progress: NullProgress | None = None) -> list[Record]:
+    if not source.path:
+        raise ValueError(f"source {source.id} is missing path")
+    archive_path = Path(source.path)
+    records: list[Record] = []
+    with zipfile.ZipFile(archive_path) as archive:
+        metadata = _archive_metadata(archive, archive_path)
+        members = _iter_instance_archive_members(archive)
+        for index, member in enumerate(members, start=1):
+            if progress:
+                progress.item("FILE", index, len(members), member, archive_path.name)
+            payload = archive.read(member)
+            records.extend(
+                _ingest_instance_payload(
+                    source=source,
+                    origin=str(archive_path.resolve()),
+                    path=member,
+                    payload=payload,
+                    source_id=str(metadata["source_id"]),
+                )
+            )
+    return records
+
+
 def _ingest_github_archive(source: SourceSpec, *, progress: NullProgress | None = None) -> list[Record]:
     if not source.owner or not source.repo:
         raise ValueError(f"source {source.id} is missing owner/repo")
@@ -629,6 +894,10 @@ def ingest_sources_with_report(
                 source_records = _ingest_local_archive(source, progress=reporter)
             elif source.type == "local_mod_archives":
                 source_records = _ingest_local_mod_archives(source, progress=reporter)
+            elif source.type == "instance_dir":
+                source_records = _ingest_instance_dir(source, progress=reporter)
+            elif source.type == "instance_archive":
+                source_records = _ingest_instance_archive(source, progress=reporter)
             else:
                 raise ValueError(f"unsupported source type: {source.type}")
             records.extend(source_records)
@@ -1149,6 +1418,46 @@ def _instance_override_rules() -> list[dict[str, str]]:
     ]
 
 
+def _instance_source_from_entry(entry: dict[str, Any], *, output_kind: str, output_root: str) -> dict[str, Any]:
+    entry_type = str(entry.get("type", "local_dir"))
+    source_type = "instance_archive" if entry_type == "local_archive" else "instance_dir"
+    return {
+        "id": entry["id"],
+        "type": source_type,
+        "path": entry["path"],
+        "output_kind": output_kind,
+        "output_root": output_root,
+        "locale": "ja_jp",
+        "content_kinds": ["lang_json", "guide_text", "patchouli_json", "patchouli_text"],
+    }
+
+
+def _instance_sources_from_discovery(
+    discovery: dict[str, Any],
+    *,
+    output_kind: str,
+    output_root_factory: Any,
+) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    for entry in discovery.get("entries", []):
+        has_relevant_content = bool(
+            entry.get("has_ja_jp")
+            or entry.get("guide_files")
+            or entry.get("patchouli_asset_files")
+            or entry.get("patchouli_data_files")
+        )
+        if not has_relevant_content:
+            continue
+        sources.append(
+            _instance_source_from_entry(
+                entry,
+                output_kind=output_kind,
+                output_root=output_root_factory(entry),
+            )
+        )
+    return sources
+
+
 def build_instance_manifest(
     instance_root: Path,
     *,
@@ -1178,9 +1487,40 @@ def build_instance_manifest(
                 "target_namespace": "minecraft",
             }
         )
-    sources.extend(mods["sources"])
-    sources.extend(openloader_resources["sources"])
-    sources.extend(resourcepacks["sources"])
+    sources.extend(
+        _instance_sources_from_discovery(
+            mods,
+            output_kind="resourcepack",
+            output_root_factory=lambda entry: "resourcepack",
+        )
+    )
+    sources.extend(
+        _instance_sources_from_discovery(
+            openloader_resources,
+            output_kind="openloader",
+            output_root_factory=lambda entry: f"config/openloader/resources/{entry.get('pack_id') or entry.get('entry_name') or entry.get('id')}",
+        )
+    )
+    sources.extend(
+        _instance_sources_from_discovery(
+            resourcepacks,
+            output_kind="resourcepack",
+            output_root_factory=lambda entry: "resourcepack",
+        )
+    )
+    patchouli_external = discover_patchouli_external_books(instance_root)
+    for entry in patchouli_external.get("entries", []):
+        sources.append(
+            {
+                "id": f"patchouli:{entry['book_name']}",
+                "type": "instance_dir",
+                "path": entry["path"],
+                "output_kind": "instance",
+                "output_root": f"patchouli_books/{entry['book_name']}",
+                "locale": locale,
+                "content_kinds": ["patchouli_json", "patchouli_text"],
+            }
+        )
     return {
         "pack": {
             "description": pack_description,
@@ -1189,12 +1529,14 @@ def build_instance_manifest(
         "build": {
             "include_generated_by_default": True,
             "include_pending_by_default": True,
+            "target_layout": "instance",
         },
         "discovery": {
             "instance_root": str(instance_root.resolve()),
             "mods": mods,
             "openloader_resources": openloader_resources,
             "resourcepacks": resourcepacks,
+            "patchouli_external_books": patchouli_external,
         },
         "sources": sources,
     }
@@ -1247,7 +1589,8 @@ def build_instance_content_report(
 
     return {
         "instance_root": str(instance_root.resolve()),
-        "lang_source_count": len(manifest["sources"]),
+        "source_count": len(manifest["sources"]),
+        "lang_source_count": len([source for source in manifest["sources"] if source.get("output_kind") == "resourcepack"]),
         "manifest": manifest,
         "mods": mods,
         "openloader_resources": openloader_resources,

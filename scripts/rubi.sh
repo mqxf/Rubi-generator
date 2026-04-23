@@ -12,6 +12,7 @@ usage() {
   cat <<'EOF'
 Usage:
   ./scripts/rubi.sh first [manifest]
+  ./scripts/rubi.sh run-instance [instance_root]
   ./scripts/rubi.sh rerun-source [manifest] <source_id...>
   ./scripts/rubi.sh rerun-failed [manifest]
   ./scripts/rubi.sh conflicts
@@ -32,6 +33,11 @@ EOF
 first_stage() {
   local manifest="${1:-$DEFAULT_MANIFEST}"
   python3 -m rubi_gto run --manifest "$manifest" --workspace "$WORKSPACE"
+}
+
+run_instance_stage() {
+  local instance_root="${1:-../gto_repos/GregTech-Odyssey}"
+  python3 -m rubi_gto run-instance --instance-root "$instance_root" --workspace "$WORKSPACE"
 }
 
 rerun_source_stage() {
@@ -122,6 +128,9 @@ shift
 case "$command" in
   first)
     first_stage "$@"
+    ;;
+  run-instance)
+    run_instance_stage "$@"
     ;;
   rerun-source)
     rerun_source_stage "$@"

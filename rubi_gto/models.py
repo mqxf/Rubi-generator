@@ -18,6 +18,9 @@ class SourceSpec:
     enabled: bool = True
     minecraft_version: str | None = None
     locale: str | None = None
+    output_kind: str = "resourcepack"
+    output_root: str | None = None
+    content_kinds: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], defaults: dict[str, Any]) -> "SourceSpec":
@@ -35,6 +38,9 @@ class SourceSpec:
             enabled=data.get("enabled", True),
             minecraft_version=data.get("minecraft_version"),
             locale=data.get("locale"),
+            output_kind=data.get("output_kind", "resourcepack"),
+            output_root=data.get("output_root"),
+            content_kinds=list(data.get("content_kinds") or []),
         )
 
 
@@ -49,6 +55,10 @@ class Record:
     review_status: str = "pending"
     issues: list[str] = field(default_factory=list)
     notes: str | None = None
+    content_type: str = "lang_json"
+    output_kind: str = "resourcepack"
+    output_path: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def record_id(self) -> str:
@@ -66,6 +76,10 @@ class Record:
             "review_status": self.review_status,
             "issues": list(self.issues),
             "notes": self.notes,
+            "content_type": self.content_type,
+            "output_kind": self.output_kind,
+            "output_path": self.output_path,
+            "metadata": dict(self.metadata),
         }
 
     @classmethod
@@ -80,4 +94,8 @@ class Record:
             review_status=data.get("review_status", "pending"),
             issues=list(data.get("issues", [])),
             notes=data.get("notes"),
+            content_type=data.get("content_type", "lang_json"),
+            output_kind=data.get("output_kind", "resourcepack"),
+            output_path=data.get("output_path"),
+            metadata=dict(data.get("metadata", {})),
         )
