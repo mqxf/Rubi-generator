@@ -226,6 +226,88 @@ class JapaneseTests(unittest.TestCase):
         self.assertEqual(decision.annotated_text, "§^望遠鏡(ぼうえんきょう)を§^観察(かんさつ)する")
         self.assertEqual(decision.status, "generated")
 
+    def test_normalizes_kana_prefix_inside_group(self) -> None:
+        class FakeAnnotator(ConsensusAnnotator):
+            def __init__(self) -> None:
+                self.available = True
+                self._jamdict_resolver = JamdictReadingResolver()
+
+            def _tokenize_fugashi(self, text: str) -> list[MorphToken]:
+                return [MorphToken("もう一度", "モウイチド", "もう一度", "名詞", "普通名詞", "*", "*")]
+
+            def _tokenize_sudachi(self, text: str) -> list[MorphToken]:
+                return [
+                    MorphToken("もう", "モウ", "もう", "副詞", "*", "*", "*"),
+                    MorphToken("一度", "イチド", "一度", "名詞", "普通名詞", "*", "*"),
+                ]
+
+        annotator = FakeAnnotator()
+        decision = annotator.annotate_with_review("もう一度")
+        self.assertEqual(decision.annotated_text, "もう§^一度(いちど)")
+        self.assertEqual(decision.status, "generated")
+
+    def test_splits_teki_group_when_other_side_splits(self) -> None:
+        class FakeAnnotator(ConsensusAnnotator):
+            def __init__(self) -> None:
+                self.available = True
+                self._jamdict_resolver = JamdictReadingResolver()
+
+            def _tokenize_fugashi(self, text: str) -> list[MorphToken]:
+                return [
+                    MorphToken("科学", "カガク", "科学", "名詞", "普通名詞", "*", "*"),
+                    MorphToken("的", "テキ", "的", "接尾辞", "*", "*", "*"),
+                ]
+
+            def _tokenize_sudachi(self, text: str) -> list[MorphToken]:
+                return [MorphToken("科学的", "カガクテキ", "科学的", "名詞", "普通名詞", "*", "*")]
+
+        annotator = FakeAnnotator()
+        decision = annotator.annotate_with_review("科学的")
+        self.assertEqual(decision.annotated_text, "§^科学(かがく)§^的(てき)")
+        self.assertEqual(decision.status, "generated")
+
+    def test_prefers_fugashi_when_only_dakuten_diff(self) -> None:
+        class FakeAnnotator(ConsensusAnnotator):
+            def __init__(self) -> None:
+                self.available = True
+                self._jamdict_resolver = JamdictReadingResolver()
+
+            def _tokenize_fugashi(self, text: str) -> list[MorphToken]:
+                return [MorphToken("分配", "ブンパイ", "分配", "名詞", "普通名詞", "*", "*")]
+
+            def _tokenize_sudachi(self, text: str) -> list[MorphToken]:
+                return [MorphToken("分配", "フンパイ", "分配", "名詞", "普通名詞", "*", "*")]
+
+        annotator = FakeAnnotator()
+        decision = annotator.annotate_with_review("分配")
+        self.assertEqual(decision.annotated_text, "§^分配(ぶんぱい)")
+        self.assertEqual(decision.status, "generated")
+
+    def test_overlap_shift_conflict_prefers_left(self) -> None:
+        class FakeAnnotator(ConsensusAnnotator):
+            def __init__(self) -> None:
+                self.available = True
+                self._jamdict_resolver = JamdictReadingResolver()
+
+            def _tokenize_fugashi(self, text: str) -> list[MorphToken]:
+                return [
+                    MorphToken("等", "トウ", "等", "名詞", "普通名詞", "*", "*"),
+                    MorphToken("分配", "ブンパイ", "分配", "名詞", "普通名詞", "*", "*"),
+                    MorphToken("カード", "カード", "カード", "名詞", "普通名詞", "*", "*"),
+                ]
+
+            def _tokenize_sudachi(self, text: str) -> list[MorphToken]:
+                return [
+                    MorphToken("等分", "トウブン", "等分", "名詞", "普通名詞", "*", "*"),
+                    MorphToken("配", "ハイ", "配", "名詞", "普通名詞", "*", "*"),
+                    MorphToken("カード", "カード", "カード", "名詞", "普通名詞", "*", "*"),
+                ]
+
+        annotator = FakeAnnotator()
+        decision = annotator.annotate_with_review("等分配カード")
+        self.assertEqual(decision.annotated_text, "§^等(とう)§^分配(ぶんぱい)カード")
+        self.assertEqual(decision.status, "generated")
+
     def test_preserves_newlines(self) -> None:
         class FakeAnnotator(ConsensusAnnotator):
             def __init__(self) -> None:

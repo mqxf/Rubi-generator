@@ -288,6 +288,237 @@ def _is_kana_text(text: str) -> bool:
     return True
 
 
+def _is_kana_char(char: str) -> bool:
+    if not char:
+        return False
+    code = ord(char)
+    if 0x3040 <= code <= 0x309F:
+        return True
+    if 0x30A0 <= code <= 0x30FF:
+        return True
+    return char == "ー"
+
+
+def _normalize_kana_prefix_suffix_groups(text: str) -> str:
+    # If an annotation includes leading/trailing kana that also exist in the reading,
+    # move those kana outside the rubi group. This preserves the plain text exactly
+    # and reduces conflicts like "§^もう一度(もういちど)" vs "もう§^一度(いちど)".
+    parts: list[str] = []
+    cursor = 0
+    for match in RUBI_PATTERN.finditer(text):
+        parts.append(text[cursor:match.start()])
+        original = match.group(0)
+        word = match.group(1).strip()
+        reading = match.group(2).strip()
+
+        # Prefix trim only: strip kana that appear before the first kanji.
+        # Suffix trimming is intentionally avoided; it can over-strip okurigana
+        # in verbs (e.g. "投げつける") and create worse segmentation conflicts.
+        prefix = ""
+        while word and reading and _is_kana_char(word[0]) and contains_kanji(word):
+            left = katakana_to_hiragana(word[0])
+            right = katakana_to_hiragana(reading[0])
+            if left != right:
+                break
+            prefix += word[0]
+            word = word[1:]
+            reading = reading[1:]
+
+        suffix = ""
+
+        if word and reading and contains_kanji(word) and not contains_kanji(reading):
+            parts.append(f"{prefix}§^{word}({reading}){suffix}")
+        else:
+            parts.append(original)
+        cursor = match.end()
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def _split_teki_group_using_other(
+    plain_text: str,
+    *,
+    split_side: str,
+    combined_side: str,
+) -> str | None:
+    if strip_rubi(split_side) != plain_text or strip_rubi(combined_side) != plain_text:
+        return None
+
+    split_spans = _annotation_spans(split_side)
+    combined_spans = _annotation_spans(combined_side)
+    if not split_spans or not combined_spans:
+        return None
+
+    for index in range(1, len(split_spans)):
+        teki_span = split_spans[index]
+        if teki_span.word != "的" or teki_span.reading != "てき":
+            continue
+        prev_span = split_spans[index - 1]
+        if prev_span.end != teki_span.start:
+            continue
+        combined_word = prev_span.word + "的"
+        combined_start = prev_span.start
+        combined_end = teki_span.end
+
+        target_index = None
+        for combined_index, span in enumerate(combined_spans):
+            if span.word == combined_word and span.start == combined_start and span.end == combined_end:
+                target_index = combined_index
+                break
+        if target_index is None:
+            continue
+
+        parts: list[str] = []
+        cursor = 0
+        match_index = 0
+        for match in RUBI_PATTERN.finditer(combined_side):
+            parts.append(combined_side[cursor:match.start()])
+            if match_index == target_index:
+                parts.append(f"§^{prev_span.word}({prev_span.reading})§^的(てき)")
+            else:
+                parts.append(match.group(0))
+            cursor = match.end()
+            match_index += 1
+        parts.append(combined_side[cursor:])
+        rewritten = "".join(parts)
+        if strip_rubi(rewritten) != plain_text:
+            return None
+        return rewritten
+
+    return None
+
+
+def _normalize_pair_for_trivial_differences(
+    plain_text: str,
+    fugashi_annotated: str,
+    sudachi_annotated: str,
+) -> tuple[str, str]:
+    fugashi = _normalize_kana_prefix_suffix_groups(fugashi_annotated)
+    sudachi = _normalize_kana_prefix_suffix_groups(sudachi_annotated)
+
+    # Canonicalize "的(てき)" grouping by splitting off `的` when the other side already does.
+    teki_rewritten = _split_teki_group_using_other(plain_text, split_side=fugashi, combined_side=sudachi)
+    if teki_rewritten:
+        sudachi = teki_rewritten
+    teki_rewritten = _split_teki_group_using_other(plain_text, split_side=sudachi, combined_side=fugashi)
+    if teki_rewritten:
+        fugashi = teki_rewritten
+
+    return fugashi, sudachi
+
+
+_DEVOICE_TABLE = {
+    "が": "か",
+    "ぎ": "き",
+    "ぐ": "く",
+    "げ": "け",
+    "ご": "こ",
+    "ざ": "さ",
+    "じ": "し",
+    "ず": "す",
+    "ぜ": "せ",
+    "ぞ": "そ",
+    "だ": "た",
+    "ぢ": "ち",
+    "づ": "つ",
+    "で": "て",
+    "ど": "と",
+    "ば": "は",
+    "び": "ひ",
+    "ぶ": "ふ",
+    "べ": "へ",
+    "ぼ": "ほ",
+    "ぱ": "は",
+    "ぴ": "ひ",
+    "ぷ": "ふ",
+    "ぺ": "へ",
+    "ぽ": "ほ",
+    "ガ": "カ",
+    "ギ": "キ",
+    "グ": "ク",
+    "ゲ": "ケ",
+    "ゴ": "コ",
+    "ザ": "サ",
+    "ジ": "シ",
+    "ズ": "ス",
+    "ゼ": "セ",
+    "ゾ": "ソ",
+    "ダ": "タ",
+    "ヂ": "チ",
+    "ヅ": "ツ",
+    "デ": "テ",
+    "ド": "ト",
+    "バ": "ハ",
+    "ビ": "ヒ",
+    "ブ": "フ",
+    "ベ": "ヘ",
+    "ボ": "ホ",
+    "パ": "ハ",
+    "ピ": "ヒ",
+    "プ": "フ",
+    "ペ": "ヘ",
+    "ポ": "ホ",
+    "ヴ": "ウ",
+}
+
+
+def _devoice_kana(text: str) -> str:
+    return "".join(_DEVOICE_TABLE.get(char, char) for char in text)
+
+
+def _choose_fugashi_when_only_dakuten_diff(
+    plain_text: str,
+    fugashi_annotated: str,
+    sudachi_annotated: str,
+) -> str | None:
+    if strip_rubi(fugashi_annotated) != plain_text or strip_rubi(sudachi_annotated) != plain_text:
+        return None
+    fugashi_spans = _annotation_spans(fugashi_annotated)
+    sudachi_spans = _annotation_spans(sudachi_annotated)
+    if not _spans_share_boundaries(fugashi_spans, sudachi_spans):
+        return None
+
+    saw_conflict = False
+    for left, right in zip(fugashi_spans, sudachi_spans):
+        if left.reading == right.reading:
+            continue
+        saw_conflict = True
+        if _devoice_kana(left.reading) != right.reading:
+            return None
+    return fugashi_annotated if saw_conflict else None
+
+
+def _choose_overlap_shift_candidate(
+    plain_text: str,
+    left_annotated: str,
+    right_annotated: str,
+) -> str | None:
+    # Handle the common pattern:
+    #   [A][BC] vs [AB][C]
+    # without inventing readings. We just choose the left side deterministically
+    # when both sides are "simple noun-ish" and fully annotated.
+    if strip_rubi(left_annotated) != plain_text or strip_rubi(right_annotated) != plain_text:
+        return None
+    left_spans = _annotation_spans(left_annotated)
+    right_spans = _annotation_spans(right_annotated)
+    if len(left_spans) != 2 or len(right_spans) != 2:
+        return None
+    if any(not span.reading or contains_kanji(span.reading) for span in left_spans + right_spans):
+        return None
+
+    left_boundary = left_spans[0].end
+    right_boundary = right_spans[0].end
+    if left_boundary == right_boundary:
+        return None
+    if abs(left_boundary - right_boundary) != 1:
+        return None
+    # Avoid messing with verb/adjective stem logic.
+    boundary_char = plain_text[min(left_boundary, right_boundary)]
+    if not contains_kanji(boundary_char):
+        return None
+    return left_annotated
+
+
 def _is_stem_span(shorter: RubiSpan, longer: RubiSpan, plain_text: str) -> bool:
     if shorter.start != longer.start or shorter.end >= longer.end:
         return False
@@ -783,6 +1014,11 @@ class ConsensusAnnotator:
 
         fugashi_annotated = annotate_tokens(fugashi_tokens)
         sudachi_annotated = annotate_tokens(sudachi_tokens)
+        fugashi_annotated, sudachi_annotated = _normalize_pair_for_trivial_differences(
+            text,
+            fugashi_annotated,
+            sudachi_annotated,
+        )
 
         if fugashi_annotated == sudachi_annotated:
             if fugashi_annotated == text:
@@ -802,6 +1038,14 @@ class ConsensusAnnotator:
         conjugation_preferred = _choose_conjugation_candidate(text, fugashi_annotated, sudachi_annotated)
         if conjugation_preferred and conjugation_preferred != text:
             return AnnotationDecision(conjugation_preferred, "generated")
+
+        dakuten_preferred = _choose_fugashi_when_only_dakuten_diff(text, fugashi_annotated, sudachi_annotated)
+        if dakuten_preferred and dakuten_preferred != text:
+            return AnnotationDecision(dakuten_preferred, "generated")
+
+        overlap_shift_preferred = _choose_overlap_shift_candidate(text, fugashi_annotated, sudachi_annotated)
+        if overlap_shift_preferred and overlap_shift_preferred != text:
+            return AnnotationDecision(overlap_shift_preferred, "generated")
 
         jamdict_preferred = _choose_jamdict_reading_candidate(
             text,
