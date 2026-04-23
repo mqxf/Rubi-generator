@@ -686,7 +686,7 @@ def llm_review(
     record_ids: list[str] | None = None,
     limit: int | None = None,
     base_url: str | None = None,
-    max_output_tokens: int = 1200,
+    max_output_tokens: int = 8192,
     max_rate_limit_retries: int = 4,
     min_request_interval_seconds: float = 0.0,
     request_timeout_seconds: float = 20.0,
