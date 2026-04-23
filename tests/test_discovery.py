@@ -6,6 +6,7 @@ from pathlib import Path
 
 from rubi_gto.models import SourceSpec
 from rubi_gto.sources import (
+    build_gto_workflow_manifest,
     build_instance_content_report,
     build_instance_manifest,
     build_local_manifest,
@@ -290,6 +291,9 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual(len(report["manifest"]["sources"]), 6)
             self.assertEqual(report["source_count"], 6)
             self.assertTrue(any(source["type"] == "ftbquests_legacy_inline" for source in report["manifest"]["sources"]))
+            quest_source = next(source for source in report["manifest"]["sources"] if source["type"] == "ftbquests_legacy_inline")
+            self.assertEqual(quest_source["portability"], "portable")
+            self.assertEqual(quest_source["full_pack_rewrite_root"], "assets/ftbquests")
 
     def test_builds_instance_manifest_with_staged_targets(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -328,3 +332,55 @@ class DiscoveryTests(unittest.TestCase):
             self.assertTrue(
                 any(source["output_kind"] == "openloader" for source in manifest["sources"][1:])
             )
+
+    def test_builds_gto_workflow_manifest_with_repo_and_instance_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            instance_root = root / "GregTech-Odyssey"
+            (instance_root / ".git").mkdir(parents=True, exist_ok=True)
+            _write_json(
+                instance_root / "resourcepacks" / "instancepack" / "pack.mcmeta",
+                {"pack": {"description": "Instance pack", "pack_format": 34}},
+            )
+            _write_json(
+                instance_root / "resourcepacks" / "instancepack" / "assets" / "gto" / "lang" / "ja_jp.json",
+                {"dup": "instance"},
+            )
+
+            mod_repo = root / "GregTech-Modern"
+            (mod_repo / ".git").mkdir(parents=True, exist_ok=True)
+            _write_json(
+                mod_repo / "src" / "main" / "resources" / "assets" / "gtceu" / "lang" / "ja_jp.json",
+                {"machine.name": "高電圧機械"},
+            )
+
+            translations_repo = root / "GTO-Translations"
+            (translations_repo / ".git").mkdir(parents=True, exist_ok=True)
+            _write_json(
+                translations_repo / "ja_jp" / "resourcepacks" / "gto-lang-ja_jp" / "pack.mcmeta",
+                {"pack": {"description": "GTO translations", "pack_format": 34}},
+            )
+            _write_json(
+                translations_repo
+                / "ja_jp"
+                / "resourcepacks"
+                / "gto-lang-ja_jp"
+                / "assets"
+                / "gto"
+                / "lang"
+                / "ja_jp.json",
+                {"dup": "repo"},
+            )
+
+            manifest = build_gto_workflow_manifest(
+                instance_root,
+                repo_root=root,
+                pack_description="Workflow pack",
+                pack_format=34,
+            )
+
+            self.assertEqual(manifest["workflow"]["merge_rule"], "instance_wins_on_duplicate_output_keys")
+            self.assertTrue(any(source["merge_priority"] == 10 for source in manifest["sources"]))
+            self.assertTrue(any(source["merge_priority"] == 20 for source in manifest["sources"]))
+            self.assertTrue(any(source["id"] == "GregTech-Modern" for source in manifest["sources"]))
+            self.assertTrue(any(source["id"].startswith("repo-pack:GTO-Translations") for source in manifest["sources"]))

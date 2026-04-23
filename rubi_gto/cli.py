@@ -8,6 +8,7 @@ from .llm_review import llm_review
 from .pipeline import annotate, build, ingest, report, run
 from .progress import ConsoleProgress
 from .sources import (
+    build_gto_workflow_manifest,
     build_instance_manifest,
     build_instance_content_report,
     build_local_manifest,
@@ -52,6 +53,8 @@ def _parser() -> argparse.ArgumentParser:
     llm_review_command.add_argument("--base-url")
     llm_review_command.add_argument("--category", dest="categories", action="append")
     llm_review_command.add_argument("--record-id", dest="record_ids", action="append")
+    llm_review_command.add_argument("--max-rate-limit-retries", type=int, default=4)
+    llm_review_command.add_argument("--min-request-interval-seconds", type=float, default=0.0)
 
     discover = subparsers.add_parser("discover-local")
     discover.add_argument("--search-root", type=Path, required=True)
@@ -89,6 +92,17 @@ def _parser() -> argparse.ArgumentParser:
     discover_instance.add_argument("--minecraft-version", default="1.20.1")
     discover_instance.add_argument("--locale", default="ja_jp")
 
+    discover_gto = subparsers.add_parser("discover-gto-workflow")
+    discover_gto.add_argument("--instance-root", type=Path, required=True)
+    discover_gto.add_argument("--repo-root", type=Path, required=True)
+    discover_gto.add_argument("--output", type=Path)
+    discover_gto.add_argument("--manifest-output", type=Path)
+    discover_gto.add_argument("--pack-description", default="Rubi GTO generated Japanese pack")
+    discover_gto.add_argument("--pack-format", type=int, default=34)
+    discover_gto.add_argument("--include-vanilla", action="store_true")
+    discover_gto.add_argument("--minecraft-version", default="1.20.1")
+    discover_gto.add_argument("--locale", default="ja_jp")
+
     run_instance = subparsers.add_parser("run-instance")
     run_instance.add_argument("--instance-root", type=Path, required=True)
     run_instance.add_argument("--workspace", type=Path, default=Path("."))
@@ -105,6 +119,24 @@ def _parser() -> argparse.ArgumentParser:
     pending_group.add_argument("--exclude-pending", dest="include_pending", action="store_false")
     run_instance.add_argument("--export-mode", choices=["overwrite", "full-pack"], default="overwrite")
     run_instance.add_argument("--export-locale", default="ja_rubi")
+
+    run_gto = subparsers.add_parser("run-gto-workflow")
+    run_gto.add_argument("--instance-root", type=Path, required=True)
+    run_gto.add_argument("--repo-root", type=Path, required=True)
+    run_gto.add_argument("--workspace", type=Path, default=Path("."))
+    run_gto.add_argument("--include-vanilla", action="store_true")
+    run_gto.add_argument("--minecraft-version", default="1.20.1")
+    run_gto.add_argument("--locale", default="ja_jp")
+    run_gto.add_argument("--source-id", dest="source_ids", action="append")
+    run_gto.add_argument("--failed-only", action="store_true")
+    include_group = run_gto.add_mutually_exclusive_group()
+    include_group.add_argument("--include-generated", dest="include_generated", action="store_true", default=None)
+    include_group.add_argument("--approved-only", dest="include_generated", action="store_false")
+    pending_group = run_gto.add_mutually_exclusive_group()
+    pending_group.add_argument("--include-pending", dest="include_pending", action="store_true", default=None)
+    pending_group.add_argument("--exclude-pending", dest="include_pending", action="store_false")
+    run_gto.add_argument("--export-mode", choices=["overwrite", "full-pack"], default="overwrite")
+    run_gto.add_argument("--export-locale", default="ja_rubi")
 
     return parser
 
@@ -136,6 +168,8 @@ def main(argv: list[str] | None = None) -> int:
             limit=args.limit,
             base_url=args.base_url,
             max_output_tokens=args.max_output_tokens,
+            max_rate_limit_retries=args.max_rate_limit_retries,
+            min_request_interval_seconds=args.min_request_interval_seconds,
             progress=progress,
         )
     elif args.command == "build":
@@ -205,6 +239,22 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps(payload["manifest"], ensure_ascii=False, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
+    elif args.command == "discover-gto-workflow":
+        payload = build_gto_workflow_manifest(
+            args.instance_root.resolve(),
+            repo_root=args.repo_root.resolve(),
+            pack_description=args.pack_description,
+            pack_format=args.pack_format,
+            include_vanilla=args.include_vanilla,
+            minecraft_version=args.minecraft_version,
+            locale=args.locale,
+        )
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        if args.manifest_output:
+            args.manifest_output.parent.mkdir(parents=True, exist_ok=True)
+            args.manifest_output.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     elif args.command == "run-instance":
         runtime_manifest = build_instance_manifest(
             args.instance_root.resolve(),
@@ -218,6 +268,36 @@ def main(argv: list[str] | None = None) -> int:
         runtime_manifest["build"]["export_mode"] = args.export_mode
         runtime_manifest["build"]["export_locale"] = args.export_locale
         runtime_manifest_path = workspace / "build" / "reports" / "instance_runtime_manifest.json"
+        runtime_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        runtime_manifest_path.write_text(
+            json.dumps(runtime_manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        payload = run(
+            runtime_manifest_path,
+            workspace,
+            include_generated=args.include_generated,
+            include_pending=args.include_pending,
+            export_mode=args.export_mode,
+            export_locale=args.export_locale,
+            progress=progress,
+            source_ids=args.source_ids,
+            failed_only=args.failed_only,
+        )
+    elif args.command == "run-gto-workflow":
+        runtime_manifest = build_gto_workflow_manifest(
+            args.instance_root.resolve(),
+            repo_root=args.repo_root.resolve(),
+            pack_description="Rubi GTO generated Japanese pack",
+            pack_format=34,
+            include_vanilla=args.include_vanilla,
+            minecraft_version=args.minecraft_version,
+            locale=args.locale,
+        )
+        runtime_manifest.setdefault("build", {})
+        runtime_manifest["build"]["export_mode"] = args.export_mode
+        runtime_manifest["build"]["export_locale"] = args.export_locale
+        runtime_manifest_path = workspace / "build" / "reports" / "gto_workflow_runtime_manifest.json"
         runtime_manifest_path.parent.mkdir(parents=True, exist_ok=True)
         runtime_manifest_path.write_text(
             json.dumps(runtime_manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",

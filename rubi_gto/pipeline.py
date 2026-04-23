@@ -7,6 +7,8 @@ from pathlib import Path
 import shutil
 from typing import Any
 
+import json
+
 from .annotator import apply_glossary, validate_annotation
 from .io_utils import ensure_dir, read_json, read_text, write_json, write_text
 from .japanese import ConsensusAnnotator, categorize_review_candidate
@@ -365,6 +367,12 @@ def _replace_locale_in_output_path(path: str, locale: str) -> str:
     return path
 
 
+def _record_output_root(record: Record, *, export_mode: str) -> str:
+    if export_mode == "full-pack":
+        return str(record.metadata.get("full_pack_output_root") or "resourcepack")
+    return str(record.metadata.get("output_root", "resourcepack"))
+
+
 def _rewrite_legacy_ftbquests_payload(payload: Any, record: Record) -> None:
     current = payload
     for part in list(record.metadata.get("rewrite_path", [])):
@@ -477,9 +485,11 @@ def build(
             "type": source.get("type"),
             "portability": source.get("portability", "portable"),
             "overwrite_destination": source.get("output_root"),
-            "full_pack_destination": source.get("full_pack_output_root") or "resourcepack"
-            if source.get("portability", "portable") == "portable"
-            else None,
+            "full_pack_destination": (
+                source.get("full_pack_output_root") or "resourcepack"
+                if source.get("portability", "portable") == "portable"
+                else None
+            ),
         }
         for source in manifest_payload.get("sources", [])
     ]
@@ -534,14 +544,15 @@ def build(
     grouped_json: dict[tuple[str, str], dict[str, Any]] = {}
     grouped_snbt: dict[tuple[str, str], Any] = {}
     grouped_text: dict[tuple[str, str], str] = {}
-    for record in records:
+    ordered_records = sorted(records, key=lambda record: int(record.metadata.get("merge_priority", 0)))
+    for record in ordered_records:
         if record.review_status not in allowed_statuses:
             continue
         if not instance_like and record.content_type == "lang_json":
             grouped[record.namespace][record.key] = record.annotated_text
             continue
         output_path = record.output_path or f"assets/{record.namespace}/lang/ja_jp.json"
-        output_root_key = "resourcepack" if resolved_export_mode == "full-pack" else str(record.metadata.get("output_root", "resourcepack"))
+        output_root_key = _record_output_root(record, export_mode=resolved_export_mode)
         if resolved_export_mode == "full-pack" and record.content_type == "lang_json":
             output_path = _replace_locale_in_output_path(output_path, resolved_export_locale)
         if record.content_type == "lang_json":

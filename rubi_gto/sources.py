@@ -638,10 +638,6 @@ def _replace_locale_in_path(path: str, locale: str) -> str:
     return path
 
 
-def _ftbquests_escape_string(text: str) -> str:
-    return text.replace("%", "%%").replace('"', '\\"')
-
-
 def _ftbquests_text_filter(text: str) -> bool:
     if not text:
         return False
@@ -674,6 +670,7 @@ def _record_extra_metadata(source: SourceSpec) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "portability": portability,
         "full_pack_supported": portability == "portable",
+        "merge_priority": int(source.extra.get("merge_priority", 0)),
     }
     if source.extra.get("full_pack_output_root"):
         metadata["full_pack_output_root"] = str(source.extra["full_pack_output_root"])
@@ -830,7 +827,6 @@ def _legacy_ftbquests_field_records(
         translation_key = f"{lang_key}.{field_name}"
         metadata = dict(base_metadata)
         metadata["translation_key"] = translation_key
-        metadata["escape_lang_value"] = True
         metadata["rewrite_path"] = list(rewrite_path)
         metadata["rewrite_field"] = field_name
         records.append(
@@ -839,7 +835,7 @@ def _legacy_ftbquests_field_records(
                 source_id=source.id,
                 source_origin=source_origin,
                 key=f"{relative_path}::{translation_key}",
-                source_text=_ftbquests_escape_string(value),
+                source_text=value,
                 metadata=metadata,
             )
         )
@@ -859,7 +855,6 @@ def _legacy_ftbquests_field_records(
                 translation_key = f"{lang_key}.{field_name}{translated_index}.rich_text{rich_index}"
                 metadata = dict(base_metadata)
                 metadata["translation_key"] = translation_key
-                metadata["escape_lang_value"] = True
                 metadata["rewrite_path"] = list(rewrite_path)
                 metadata["rewrite_field"] = field_name
                 metadata["rewrite_list_index"] = translated_index
@@ -871,7 +866,7 @@ def _legacy_ftbquests_field_records(
                         source_id=source.id,
                         source_origin=source_origin,
                         key=f"{relative_path}::{translation_key}",
-                        source_text=_ftbquests_escape_string(source_text),
+                        source_text=source_text,
                         metadata=metadata,
                     )
                 )
@@ -880,7 +875,6 @@ def _legacy_ftbquests_field_records(
             translation_key = f"{lang_key}.{field_name}{translated_index}"
             metadata = dict(base_metadata)
             metadata["translation_key"] = translation_key
-            metadata["escape_lang_value"] = True
             metadata["rewrite_path"] = list(rewrite_path)
             metadata["rewrite_field"] = field_name
             metadata["rewrite_list_index"] = translated_index
@@ -890,7 +884,7 @@ def _legacy_ftbquests_field_records(
                     source_id=source.id,
                     source_origin=source_origin,
                     key=f"{relative_path}::{translation_key}",
-                    source_text=_ftbquests_escape_string(item),
+                    source_text=item,
                     metadata=metadata,
                 )
             )
@@ -1654,7 +1648,8 @@ def discover_ftbquests(instance_root: Path) -> dict[str, Any]:
         lang_files = [path for path in snbt_files if path.startswith("lang/")]
         content_files = [path for path in snbt_files if not path.startswith("lang/")]
         quest_root_type = "ftbquests_locale_snbt" if lang_files else "ftbquests_legacy_inline"
-        portability = "overwrite_only" if quest_root_type == "ftbquests_locale_snbt" else "overwrite_only"
+        portability = "overwrite_only" if quest_root_type == "ftbquests_locale_snbt" else "portable"
+        full_pack_rewrite_root = "assets/ftbquests" if quest_root_type == "ftbquests_legacy_inline" else None
         entries.append(
             {
                 "path": str(quest_root.resolve()),
@@ -1669,7 +1664,8 @@ def discover_ftbquests(instance_root: Path) -> dict[str, Any]:
                 "portability": portability,
                 "portable": portability == "portable",
                 "overwrite_output_root": str(quest_root.relative_to(instance_root).as_posix()),
-                "full_pack_output_root": None,
+                "full_pack_output_root": full_pack_rewrite_root,
+                "full_pack_rewrite_root": full_pack_rewrite_root,
                 "sample_files": snbt_files[:20],
             }
         )
@@ -1782,7 +1778,7 @@ def _instance_override_rules() -> list[dict[str, str]]:
 def _instance_source_from_entry(entry: dict[str, Any], *, output_kind: str, output_root: str) -> dict[str, Any]:
     entry_type = str(entry.get("type", "local_dir"))
     source_type = "instance_archive" if entry_type == "local_archive" else "instance_dir"
-    return {
+    payload = {
         "id": entry["id"],
         "type": source_type,
         "path": entry["path"],
@@ -1792,6 +1788,9 @@ def _instance_source_from_entry(entry: dict[str, Any], *, output_kind: str, outp
         "content_kinds": ["lang_json", "guide_text", "patchouli_json", "patchouli_text"],
         "portability": "portable" if output_kind != "instance" else "overwrite_only",
     }
+    if output_kind != "instance":
+        payload["full_pack_output_root"] = "resourcepack"
+    return payload
 
 
 def _instance_sources_from_discovery(
@@ -1900,6 +1899,8 @@ def build_instance_manifest(
                     "output_root": entry["overwrite_output_root"],
                     "rewritten_output_root": entry["overwrite_output_root"],
                     "lang_output_root": quest_pack_root,
+                    "full_pack_rewrite_root": entry.get("full_pack_rewrite_root"),
+                    "full_pack_output_root": entry.get("full_pack_output_root"),
                     "content_kinds": ["ftbquests_legacy_inline", "ftbquests_generated_lang_json"],
                     "portability": entry.get("portability", "overwrite_only"),
                     "quest_root_type": entry.get("quest_root_type"),
@@ -2027,6 +2028,135 @@ def build_instance_content_report(
         "portability_report": portability_report,
         "override_rules": _instance_override_rules(),
     }
+
+
+def _direct_repo_roots(search_root: Path) -> list[Path]:
+    if not search_root.exists():
+        return []
+    return sorted(
+        path
+        for path in search_root.iterdir()
+        if path.is_dir() and (path / ".git").exists()
+    )
+
+
+def _discover_repo_resourcepack_sources(
+    repo_root: Path,
+    *,
+    locale: str,
+    source_prefix: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    sources: list[dict[str, Any]] = []
+    discoveries: list[dict[str, Any]] = []
+    resourcepack_dirs = sorted(path for path in repo_root.rglob("resourcepacks") if path.is_dir())
+    for resourcepack_dir in resourcepack_dirs:
+        discovery = discover_resource_packs(resourcepack_dir, source_prefix=source_prefix)
+        discoveries.append(
+            {
+                "repo_root": str(repo_root.resolve()),
+                "resourcepacks_root": str(resourcepack_dir.resolve()),
+                "discovery": discovery,
+            }
+        )
+        pack_sources = _instance_sources_from_discovery(
+            discovery,
+            output_kind="resourcepack",
+            output_root_factory=lambda entry: "resourcepack",
+        )
+        for source in pack_sources:
+            source["locale"] = locale
+            source["merge_priority"] = 10
+        sources.extend(pack_sources)
+    return sources, discoveries
+
+
+def build_gto_workflow_manifest(
+    instance_root: Path,
+    *,
+    repo_root: Path,
+    pack_description: str,
+    pack_format: int,
+    include_vanilla: bool = False,
+    minecraft_version: str = "1.20.1",
+    locale: str = "ja_jp",
+) -> dict[str, Any]:
+    instance_root = instance_root.resolve()
+    repo_root = repo_root.resolve()
+    repo_sources: list[dict[str, Any]] = []
+    repo_discovery: list[dict[str, Any]] = []
+
+    for local_repo in _direct_repo_roots(repo_root):
+        if local_repo == instance_root:
+            continue
+        pack_sources, pack_discoveries = _discover_repo_resourcepack_sources(
+            local_repo,
+            locale=locale,
+            source_prefix=f"repo-pack:{local_repo.name}",
+        )
+        local_manifest = build_local_manifest(
+            local_repo,
+            pack_description=pack_description,
+            pack_format=pack_format,
+            include_vanilla=False,
+            minecraft_version=minecraft_version,
+            locale=locale,
+        )
+        local_sources = [
+            source
+            for source in list(local_manifest.get("sources", []))
+            if not _source_is_resourcepack_only_repo_source(source)
+        ]
+        for source in local_sources:
+            source["merge_priority"] = 10
+        repo_sources.extend(local_sources)
+        repo_sources.extend(pack_sources)
+        repo_discovery.append(
+            {
+                "repo_root": str(local_repo.resolve()),
+                "local_manifest_sources": len(local_sources),
+                "resourcepack_discoveries": pack_discoveries,
+            }
+        )
+
+    instance_manifest = build_instance_manifest(
+        instance_root,
+        pack_description=pack_description,
+        pack_format=pack_format,
+        include_vanilla=include_vanilla,
+        minecraft_version=minecraft_version,
+        locale=locale,
+    )
+    instance_sources = list(instance_manifest.get("sources", []))
+    for source in instance_sources:
+        source["merge_priority"] = 20
+
+    return {
+        "pack": {
+            "description": pack_description,
+            "pack_format": pack_format,
+        },
+        "build": {
+            "include_generated_by_default": True,
+            "include_pending_by_default": True,
+            "target_layout": "instance",
+        },
+        "workflow": {
+            "type": "gto_instance_repo_merge",
+            "instance_root": str(instance_root),
+            "repo_root": str(repo_root),
+            "merge_rule": "instance_wins_on_duplicate_output_keys",
+        },
+        "discovery": {
+            "repo_sources": repo_discovery,
+            "instance": instance_manifest.get("discovery", {}),
+        },
+        "sources": repo_sources + instance_sources,
+    }
+
+
+def _source_is_resourcepack_only_repo_source(source: dict[str, Any]) -> bool:
+    detected_files = list(source.get("detected_files", []))
+    return bool(detected_files) and all("resourcepacks/" in path for path in detected_files)
 
 
 def _normalize_label(text: str) -> str:

@@ -13,6 +13,7 @@ usage() {
 Usage:
   ./scripts/rubi.sh first [manifest]
   ./scripts/rubi.sh run-instance [instance_root]
+  ./scripts/rubi.sh run-gto-workflow [instance_root] [repo_root]
   ./scripts/rubi.sh rerun-source [manifest] <source_id...>
   ./scripts/rubi.sh rerun-failed [manifest]
   ./scripts/rubi.sh conflicts
@@ -23,6 +24,7 @@ Usage:
   ./scripts/rubi.sh discover-mod-archives [mods_dir] [output]
   ./scripts/rubi.sh discover-packwiz [pack_root] [search_root] [output]
   ./scripts/rubi.sh discover-instance [instance_root] [report_output] [manifest_output]
+  ./scripts/rubi.sh discover-gto-workflow [instance_root] [repo_root] [manifest_output]
 
 Defaults:
   manifest: manifests/vanilla_only.json
@@ -38,6 +40,12 @@ first_stage() {
 run_instance_stage() {
   local instance_root="${1:-../gto_repos/GregTech-Odyssey}"
   python3 -m rubi_gto run-instance --instance-root "$instance_root" --workspace "$WORKSPACE"
+}
+
+run_gto_workflow_stage() {
+  local instance_root="${1:-../gto_repos/GregTech-Odyssey}"
+  local repo_root="${2:-../gto_repos}"
+  python3 -m rubi_gto run-gto-workflow --instance-root "$instance_root" --repo-root "$repo_root" --workspace "$WORKSPACE"
 }
 
 rerun_source_stage() {
@@ -117,6 +125,16 @@ discover_instance_stage() {
     --manifest-output "$manifest_output"
 }
 
+discover_gto_workflow_stage() {
+  local instance_root="${1:-../gto_repos/GregTech-Odyssey}"
+  local repo_root="${2:-../gto_repos}"
+  local manifest_output="${3:-build/reports/gto_workflow_sources.json}"
+  python3 -m rubi_gto discover-gto-workflow \
+    --instance-root "$instance_root" \
+    --repo-root "$repo_root" \
+    --manifest-output "$manifest_output"
+}
+
 if [[ $# -lt 1 ]]; then
   usage
   exit 1
@@ -131,6 +149,9 @@ case "$command" in
     ;;
   run-instance)
     run_instance_stage "$@"
+    ;;
+  run-gto-workflow)
+    run_gto_workflow_stage "$@"
     ;;
   rerun-source)
     rerun_source_stage "$@"
@@ -161,6 +182,9 @@ case "$command" in
     ;;
   discover-instance)
     discover_instance_stage "$@"
+    ;;
+  discover-gto-workflow)
+    discover_gto_workflow_stage "$@"
     ;;
   -h|--help|help)
     usage

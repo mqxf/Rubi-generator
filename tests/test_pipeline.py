@@ -3,8 +3,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from rubi_gto.annotator import strip_rubi
 from rubi_gto.pipeline import INGESTED_PATH, SOURCE_REPORT_PATH, build, ingest, report, run
-from rubi_gto.sources import build_instance_manifest
+from rubi_gto.sources import build_gto_workflow_manifest, build_instance_manifest
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -358,6 +359,76 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("§^高電圧(こうでんあつ)§^機械(きかい)", guide_text)
             self.assertEqual(patchouli_book["landing_text"], "§^遠心分離機(えんしんぶんりき)")
 
+    def test_full_pack_flattens_portable_openloader_content_into_pack_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            _write_json(
+                tmp_path / "config" / "openloader" / "resources" / "quests" / "pack.mcmeta",
+                {"id": "gto_quests", "pack": {"description": "Quest pack", "pack_format": 34}},
+            )
+            guide_path = (
+                tmp_path
+                / "config"
+                / "openloader"
+                / "resources"
+                / "quests"
+                / "assets"
+                / "ae2"
+                / "ae2guide"
+                / "_ja_jp"
+                / "page.md"
+            )
+            guide_path.parent.mkdir(parents=True, exist_ok=True)
+            guide_path.write_text("# 高電圧機械", encoding="utf-8")
+            _write_json(
+                tmp_path / "review" / "glossary.json",
+                {
+                    "terms": [
+                        {"plain": "高電圧", "annotated": "§^高電圧(こうでんあつ)"},
+                        {"plain": "機械", "annotated": "§^機械(きかい)"},
+                    ]
+                },
+            )
+            _write_json(tmp_path / "review" / "review_entries.json", {})
+            manifest = build_instance_manifest(
+                tmp_path,
+                pack_description="Instance pack",
+                pack_format=34,
+            )
+            _write_json(tmp_path / "manifest.json", manifest)
+
+            summary = run(
+                tmp_path / "manifest.json",
+                tmp_path,
+                include_generated=True,
+                include_pending=False,
+                export_mode="full-pack",
+                export_locale="ja_rubi",
+            )
+
+            flattened_guide = (
+                tmp_path / "build" / "resourcepack" / "assets" / "ae2" / "ae2guide" / "_ja_jp" / "page.md"
+            )
+            nested_guide = (
+                tmp_path
+                / "build"
+                / "resourcepack"
+                / "config"
+                / "openloader"
+                / "resources"
+                / "gto_quests"
+                / "assets"
+                / "ae2"
+                / "ae2guide"
+                / "_ja_jp"
+                / "page.md"
+            )
+
+            self.assertEqual(summary["build"]["export_mode"], "full-pack")
+            self.assertTrue(flattened_guide.exists())
+            self.assertFalse(nested_guide.exists())
+            self.assertIn("§^高電圧(こうでんあつ)§^機械(きかい)", flattened_guide.read_text(encoding="utf-8"))
+
     def test_build_uses_manifest_default_for_generated_entries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             tmp_path = Path(temp_dir)
@@ -680,6 +751,139 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("ja_rubi", pack_meta["language"])
             self.assertEqual(full_pack_lang["gto.test.quests.quest_a.subtitle"], "§^遠心分離機(えんしんぶんりき)")
             self.assertIn('{gto.test.quests.quest_a.description0}', full_pack_snbt)
+
+    def test_legacy_ftbquests_preserves_unescaped_source_text_in_lang_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            quest_root = tmp_path / "config" / "ftbquests" / "quests"
+            chapter_path = quest_root / "chapters" / "escaped.snbt"
+            chapter_path.parent.mkdir(parents=True, exist_ok=True)
+            chapter_path.write_text(
+                "\n".join(
+                    [
+                        "{",
+                        '\tquests: [',
+                        "\t\t{",
+                        '\t\t\tid: "quest_a"',
+                        '\t\t\ttitle: \'Quote "A" %s\'',
+                        "\t\t}",
+                        "\t]",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            _write_json(tmp_path / "review" / "glossary.json", {"terms": []})
+            _write_json(tmp_path / "review" / "review_entries.json", {})
+            _write_json(
+                tmp_path / "review" / "suggestions.json",
+                {
+                    'gto:chapters/escaped.snbt::gto.escaped.quests.quest_a.title': {
+                        "annotated_text": 'Quote "A" %s'
+                    }
+                },
+            )
+            _write_json(
+                tmp_path / "manifest.json",
+                {
+                    "pack": {"description": "test pack", "pack_format": 34},
+                    "build": {
+                        "include_generated_by_default": True,
+                        "include_pending_by_default": False,
+                        "target_layout": "instance",
+                    },
+                    "sources": [
+                        {
+                            "id": "ftbquests:quests",
+                            "type": "ftbquests_legacy_inline",
+                            "path": str(quest_root),
+                            "target_namespace": "gto",
+                            "locale": "ja_jp",
+                            "output_kind": "instance",
+                            "output_root": "config/ftbquests/quests",
+                            "rewritten_output_root": "config/ftbquests/quests",
+                            "lang_output_root": "config/openloader/resources/gto_quests",
+                            "full_pack_rewrite_root": "assets/ftbquests",
+                            "portability": "portable",
+                        }
+                    ],
+                },
+            )
+
+            run(tmp_path / "manifest.json", tmp_path, include_generated=True, include_pending=True)
+
+            annotated = json.loads((tmp_path / "build" / "annotated_records.json").read_text(encoding="utf-8"))
+            self.assertEqual(annotated[0]["source_text"], 'Quote "A" %s')
+            lang_payload = json.loads(
+                (
+                    tmp_path
+                    / "build"
+                    / "staged"
+                    / "config"
+                    / "openloader"
+                    / "resources"
+                    / "gto_quests"
+                    / "assets"
+                    / "gto"
+                    / "lang"
+                    / "ja_jp.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(lang_payload["gto.escaped.quests.quest_a.title"], 'Quote "A" %s')
+
+    def test_gto_workflow_merge_prefers_instance_on_duplicate_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            instance_root = root / "GregTech-Odyssey"
+            (instance_root / ".git").mkdir(parents=True, exist_ok=True)
+            _write_json(
+                instance_root / "resourcepacks" / "instancepack" / "pack.mcmeta",
+                {"pack": {"description": "Instance pack", "pack_format": 34}},
+            )
+            _write_json(
+                instance_root / "resourcepacks" / "instancepack" / "assets" / "gto" / "lang" / "ja_jp.json",
+                {"dup.key": "インスタンス", "instance.only": "現地"},
+            )
+
+            translations_repo = root / "GTO-Translations"
+            (translations_repo / ".git").mkdir(parents=True, exist_ok=True)
+            _write_json(
+                translations_repo / "ja_jp" / "resourcepacks" / "gto-lang-ja_jp" / "pack.mcmeta",
+                {"pack": {"description": "Repo pack", "pack_format": 34}},
+            )
+            _write_json(
+                translations_repo
+                / "ja_jp"
+                / "resourcepacks"
+                / "gto-lang-ja_jp"
+                / "assets"
+                / "gto"
+                / "lang"
+                / "ja_jp.json",
+                {"dup.key": "リポジトリ", "repo.only": "翻訳"},
+            )
+
+            _write_json(root / "review" / "glossary.json", {"terms": []})
+            _write_json(root / "review" / "review_entries.json", {})
+            manifest = build_gto_workflow_manifest(
+                instance_root,
+                repo_root=root,
+                pack_description="Workflow pack",
+                pack_format=34,
+            )
+            _write_json(root / "manifest.json", manifest)
+
+            summary = run(root / "manifest.json", root)
+            merged = json.loads(
+                (root / "build" / "staged" / "resourcepack" / "assets" / "gto" / "lang" / "ja_jp.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            self.assertEqual(summary["build"]["target_layout"], "instance")
+            self.assertEqual(strip_rubi(merged["dup.key"]), "インスタンス")
+            self.assertEqual(strip_rubi(merged["repo.only"]), "翻訳")
+            self.assertEqual(strip_rubi(merged["instance.only"]), "現地")
 
     def test_ftbquests_locale_snbt_overwrite_and_full_pack_block(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

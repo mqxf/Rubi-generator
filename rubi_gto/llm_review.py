@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import time
 from typing import Any, Protocol
 import urllib.error
 import urllib.request
@@ -198,11 +199,75 @@ class OpenAIResponsesHTTPClient:
                 raw_response = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"OpenAI API request failed with HTTP {exc.code}: {detail}") from exc
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            raise RuntimeError(_format_http_error(exc.code, detail, retry_after)) from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"OpenAI API request failed: {exc.reason}") from exc
 
         return _extract_structured_response(raw_response)
+
+
+def _format_http_error(status_code: int, detail: str, retry_after: str | None) -> str:
+    message = f"OpenAI API request failed with HTTP {status_code}: {detail}"
+    if retry_after:
+        message += f" retry_after={retry_after}"
+    return message
+
+
+def _retry_after_seconds(error_text: str) -> float | None:
+    token = "retry_after="
+    if token not in error_text:
+        return None
+    raw = error_text.split(token, 1)[1].split()[0].strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return None
+
+
+def _is_rate_limit_error(error_text: str) -> bool:
+    lowered = error_text.lower()
+    return "http 429" in lowered or "rate limit" in lowered
+
+
+def _request_with_rate_limit_retry(
+    client: StructuredResponseClient,
+    *,
+    model: str,
+    instructions: str,
+    input_text: str,
+    schema_name: str,
+    schema: dict[str, Any],
+    reasoning_effort: str | None,
+    max_output_tokens: int,
+    max_rate_limit_retries: int,
+    min_request_interval_seconds: float,
+    progress: NullProgress | None = None,
+) -> dict[str, Any]:
+    attempt = 0
+    while True:
+        if min_request_interval_seconds > 0:
+            time.sleep(min_request_interval_seconds)
+        try:
+            return client.create_structured_response(
+                model=model,
+                instructions=instructions,
+                input_text=input_text,
+                schema_name=schema_name,
+                schema=schema,
+                reasoning_effort=reasoning_effort,
+                max_output_tokens=max_output_tokens,
+            )
+        except Exception as exc:
+            error_text = str(exc)
+            if attempt >= max_rate_limit_retries or not _is_rate_limit_error(error_text):
+                raise
+            retry_after = _retry_after_seconds(error_text)
+            wait_seconds = retry_after if retry_after is not None else min(60.0, 5.0 * (2**attempt))
+            if progress:
+                progress.note("RATE", f"rate limited, waiting {wait_seconds:.1f}s before retry")
+            time.sleep(wait_seconds)
+            attempt += 1
 
 
 def _strip_matching_quotes(value: str) -> str:
@@ -552,6 +617,8 @@ def llm_review(
     limit: int | None = None,
     base_url: str | None = None,
     max_output_tokens: int = 1200,
+    max_rate_limit_retries: int = 4,
+    min_request_interval_seconds: float = 0.0,
     client: StructuredResponseClient | None = None,
     progress: NullProgress | None = None,
 ) -> dict[str, Any]:
@@ -573,7 +640,8 @@ def llm_review(
         prompt = _build_input_text(candidate)
         try:
             assert resolved_client is not None
-            resolution = resolved_client.create_structured_response(
+            resolution = _request_with_rate_limit_retry(
+                resolved_client,
                 model=model,
                 instructions=LLM_REVIEW_INSTRUCTIONS,
                 input_text=prompt,
@@ -581,6 +649,9 @@ def llm_review(
                 schema=LLM_REVIEW_SCHEMA,
                 reasoning_effort=reasoning_effort,
                 max_output_tokens=max_output_tokens,
+                max_rate_limit_retries=max_rate_limit_retries,
+                min_request_interval_seconds=min_request_interval_seconds,
+                progress=reporter,
             )
             annotated_text, resolution_issues = _resolve_candidate_output(candidate, resolution)
             if resolution_issues:
@@ -780,4 +851,6 @@ def llm_review(
         "written_suggestions_path": str(GENERATED_LLM_SUGGESTIONS_PATH),
         "written_results_path": str(GENERATED_LLM_REVIEW_RESULTS_PATH),
         "written_report_path": str(GENERATED_LLM_REVIEW_REPORT_PATH),
+        "max_rate_limit_retries": max_rate_limit_retries,
+        "min_request_interval_seconds": min_request_interval_seconds,
     }

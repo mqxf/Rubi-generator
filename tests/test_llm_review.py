@@ -50,6 +50,32 @@ class FakeClient:
         return self._responses.pop(0)
 
 
+class RetryThenSuccessClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def create_structured_response(
+        self,
+        *,
+        model: str,
+        instructions: str,
+        input_text: str,
+        schema_name: str,
+        schema: dict[str, object],
+        reasoning_effort: str | None,
+        max_output_tokens: int,
+    ) -> dict[str, object]:
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("OpenAI API request failed with HTTP 429: rate limit exceeded retry_after=0")
+        return {
+            "resolution_type": "pick_option",
+            "option_choice": "a",
+            "conflict_choices": [],
+            "final_annotation": "",
+        }
+
+
 class LLMReviewTests(unittest.TestCase):
     def test_load_env_file_sets_missing_values_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -336,3 +362,49 @@ class LLMReviewTests(unittest.TestCase):
             self.assertEqual(summary["status_counts"], {"suggested": 1})
             self.assertEqual(annotated[0]["annotated_text"], "§^一人(ひとり)で§^遊(あそ)ぶ")
             self.assertEqual(annotated[0]["notes"], "suggestion:manual-llm")
+
+    def test_llm_review_retries_rate_limit_then_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            _write_json(
+                tmp_path / "review" / "generated" / "review_candidates.json",
+                {
+                    "candidate_count": 1,
+                    "candidates": {
+                        "minecraft:adv.trade": {
+                            "id": "minecraft:adv.trade",
+                            "namespace": "minecraft",
+                            "key": "adv.trade",
+                            "category": "compound_or_lexical_conflict",
+                            "source_text": "村人と取引をする",
+                            "current_text": "村人と取引をする",
+                            "reason": "analyzer_conflict",
+                            "options": [
+                                {
+                                    "source": "fugashi+unidic",
+                                    "annotated_text": "§^村人(むらびと)と§^取引(とりひき)をする",
+                                },
+                                {
+                                    "source": "sudachi-full",
+                                    "annotated_text": "§^村(そん)§^人(じん)と§^取引(とりひき)をする",
+                                },
+                            ],
+                            "source_origin": "test",
+                        }
+                    },
+                },
+            )
+            client = RetryThenSuccessClient()
+            with mock.patch("rubi_gto.llm_review.time.sleep") as mocked_sleep:
+                summary = llm_review(
+                    tmp_path,
+                    model="gpt-4.1-mini",
+                    client=client,
+                    max_rate_limit_retries=2,
+                )
+
+            suggestions = json.loads((tmp_path / GENERATED_LLM_SUGGESTIONS_PATH).read_text(encoding="utf-8"))
+            self.assertEqual(client.calls, 2)
+            self.assertEqual(summary["status_counts"], {"suggested": 1})
+            self.assertEqual(suggestions["minecraft:adv.trade"]["annotated_text"], "§^村人(むらびと)と§^取引(とりひき)をする")
+            mocked_sleep.assert_called_with(0.0)
