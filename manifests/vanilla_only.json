@@ -1,0 +1,19 @@
+{
+  "pack": {
+    "description": "Rubi vanilla Minecraft 1.20.1 Japanese pack",
+    "pack_format": 34
+  },
+  "build": {
+    "include_generated_by_default": true,
+    "include_pending_by_default": true
+  },
+  "sources": [
+    {
+      "id": "minecraft-vanilla-1.20.1",
+      "type": "minecraft_assets",
+      "minecraft_version": "1.20.1",
+      "locale": "ja_jp",
+      "target_namespace": "minecraft"
+    }
+  ]
+}

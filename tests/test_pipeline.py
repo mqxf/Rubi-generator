@@ -1,0 +1,378 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from rubi_gto.pipeline import INGESTED_PATH, build, ingest, report, run
+
+
+def _write_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+class PipelineTests(unittest.TestCase):
+    def test_ingest_preserves_previous_records_on_total_source_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            _write_json(
+                tmp_path / INGESTED_PATH,
+                [
+                    {
+                        "namespace": "minecraft",
+                        "key": "menu.singleplayer",
+                        "source_text": "一人で遊ぶ",
+                        "annotated_text": "一人で遊ぶ",
+                        "source_origin": "cached",
+                        "source_id": "cached",
+                        "review_status": "pending",
+                        "issues": [],
+                        "notes": None,
+                    }
+                ],
+            )
+            _write_json(
+                tmp_path / "manifest.json",
+                {
+                    "pack": {"description": "test pack", "pack_format": 34},
+                    "sources": [
+                        {
+                            "id": "broken-source",
+                            "type": "unsupported_source_type",
+                        }
+                    ],
+                },
+            )
+
+            summary = ingest(tmp_path / "manifest.json", tmp_path)
+            ingested = json.loads((tmp_path / INGESTED_PATH).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["record_count"], 0)
+            self.assertTrue(summary["errors"])
+            self.assertTrue(summary["preserved_previous_records"])
+            self.assertEqual(len(ingested), 1)
+
+    def test_pipeline_builds_resource_pack_from_local_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            source_root = tmp_path / "fixtures"
+            _write_json(
+                source_root / "assets" / "minecraft" / "lang" / "ja_jp.json",
+                {
+                    "menu.singleplayer": "一人で遊ぶ",
+                    "menu.multiplayer": "マルチプレイ",
+                },
+            )
+
+            manifest = {
+                "pack": {"description": "test pack", "pack_format": 34},
+                "sources": [
+                    {
+                        "id": "local-minecraft",
+                        "type": "local_dir",
+                        "path": str(source_root),
+                        "include_globs": ["**/assets/*/lang/ja_jp.json"],
+                    }
+                ],
+            }
+            _write_json(tmp_path / "manifest.json", manifest)
+            _write_json(
+                tmp_path / "review" / "review_entries.json",
+                {
+                    "minecraft:menu.singleplayer": {
+                        "approved": True,
+                        "override_text": "§^一人(ひとり)で§^遊(あそ)ぶ",
+                    }
+                },
+            )
+            _write_json(tmp_path / "review" / "glossary.json", {"terms": []})
+
+            summary = run(tmp_path / "manifest.json", tmp_path, include_generated=False)
+
+            output_path = tmp_path / "build" / "resourcepack" / "assets" / "minecraft" / "lang" / "ja_jp.json"
+            built = json.loads(output_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["ingest"]["record_count"], 2)
+            self.assertEqual(summary["report"]["pending_count"], 1)
+            self.assertEqual(built, {"menu.singleplayer": "§^一人(ひとり)で§^遊(あそ)ぶ"})
+
+    def test_pipeline_can_include_generated_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            source_root = tmp_path / "fixtures"
+            _write_json(
+                source_root / "assets" / "gregtech" / "lang" / "ja_jp.json",
+                {"machine.name": "高電圧機械"},
+            )
+            _write_json(
+                tmp_path / "manifest.json",
+                {
+                    "pack": {"description": "test pack", "pack_format": 34},
+                    "sources": [
+                        {
+                            "id": "local-gregtech",
+                            "type": "local_dir",
+                            "path": str(source_root),
+                            "include_globs": ["**/assets/*/lang/ja_jp.json"],
+                        }
+                    ],
+                },
+            )
+            _write_json(
+                tmp_path / "review" / "glossary.json",
+                {
+                    "terms": [
+                        {"plain": "高電圧", "annotated": "§^高電圧(こうでんあつ)"},
+                        {"plain": "機械", "annotated": "§^機械(きかい)"},
+                    ]
+                },
+            )
+            _write_json(tmp_path / "review" / "review_entries.json", {})
+
+            summary = run(tmp_path / "manifest.json", tmp_path, include_generated=True)
+
+            output_path = tmp_path / "build" / "resourcepack" / "assets" / "gregtech" / "lang" / "ja_jp.json"
+            built = json.loads(output_path.read_text(encoding="utf-8"))
+
+            self.assertTrue(summary["build"]["include_generated"])
+            self.assertEqual(built["machine.name"], "§^高電圧(こうでんあつ)§^機械(きかい)")
+
+    def test_pipeline_uses_suggestions_before_manual_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            source_root = tmp_path / "fixtures"
+            _write_json(
+                source_root / "assets" / "gregtech" / "lang" / "ja_jp.json",
+                {"machine.name": "遠心分離機"},
+            )
+            _write_json(
+                tmp_path / "manifest.json",
+                {
+                    "pack": {"description": "test pack", "pack_format": 34},
+                    "sources": [
+                        {
+                            "id": "local-gregtech",
+                            "type": "local_dir",
+                            "path": str(source_root),
+                            "include_globs": ["**/assets/*/lang/ja_jp.json"],
+                        }
+                    ],
+                },
+            )
+            _write_json(tmp_path / "review" / "glossary.json", {"terms": []})
+            _write_json(
+                tmp_path / "review" / "suggestions.json",
+                {
+                    "gregtech:machine.name": {
+                        "annotated_text": "§^遠心分離機(えんしんぶんりき)",
+                        "source": "llm",
+                    }
+                },
+            )
+            _write_json(tmp_path / "review" / "review_entries.json", {})
+
+            summary = run(tmp_path / "manifest.json", tmp_path, include_generated=True)
+            annotated_records = json.loads((tmp_path / "build" / "annotated_records.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["annotate"]["status_counts"]["suggested"], 1)
+            self.assertEqual(annotated_records[0]["annotated_text"], "§^遠心分離機(えんしんぶんりき)")
+            self.assertEqual(annotated_records[0]["notes"], "suggestion:llm")
+
+    def test_build_uses_manifest_default_for_generated_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            source_root = tmp_path / "fixtures"
+            _write_json(
+                source_root / "assets" / "minecraft" / "lang" / "ja_jp.json",
+                {"menu.singleplayer": "一人で遊ぶ"},
+            )
+            _write_json(
+                tmp_path / "manifest.json",
+                {
+                    "pack": {"description": "test pack", "pack_format": 34},
+                    "build": {"include_generated_by_default": True},
+                    "sources": [
+                        {
+                            "id": "local-minecraft",
+                            "type": "local_dir",
+                            "path": str(source_root),
+                            "include_globs": ["**/assets/*/lang/ja_jp.json"],
+                        }
+                    ],
+                },
+            )
+            _write_json(
+                tmp_path / "review" / "glossary.json",
+                {"terms": [{"plain": "一人", "annotated": "§^一人(ひとり)"}, {"plain": "遊", "annotated": "§^遊(あそ)"}]},
+            )
+            _write_json(tmp_path / "review" / "review_entries.json", {})
+
+            run(tmp_path / "manifest.json", tmp_path)
+            built = json.loads(
+                (tmp_path / "build" / "resourcepack" / "assets" / "minecraft" / "lang" / "ja_jp.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(built["menu.singleplayer"], "§^一人(ひとり)で§^遊(あそ)ぶ")
+
+    def test_build_can_override_manifest_default_to_approved_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            source_root = tmp_path / "fixtures"
+            _write_json(
+                source_root / "assets" / "minecraft" / "lang" / "ja_jp.json",
+                {"menu.singleplayer": "一人で遊ぶ"},
+            )
+            _write_json(
+                tmp_path / "manifest.json",
+                {
+                    "pack": {"description": "test pack", "pack_format": 34},
+                    "build": {"include_generated_by_default": True},
+                    "sources": [
+                        {
+                            "id": "local-minecraft",
+                            "type": "local_dir",
+                            "path": str(source_root),
+                            "include_globs": ["**/assets/*/lang/ja_jp.json"],
+                        }
+                    ],
+                },
+            )
+            _write_json(
+                tmp_path / "review" / "glossary.json",
+                {"terms": [{"plain": "一人", "annotated": "§^一人(ひとり)"}, {"plain": "遊", "annotated": "§^遊(あそ)"}]},
+            )
+            _write_json(tmp_path / "review" / "review_entries.json", {})
+
+            run(tmp_path / "manifest.json", tmp_path)
+            summary = build(tmp_path / "manifest.json", tmp_path, include_generated=False)
+            self.assertFalse(summary["include_generated"])
+            self.assertFalse(
+                (tmp_path / "build" / "resourcepack" / "assets" / "minecraft" / "lang" / "ja_jp.json").exists()
+            )
+
+    def test_build_can_include_pending_entries_from_manifest_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            source_root = tmp_path / "fixtures"
+            _write_json(
+                source_root / "assets" / "minecraft" / "lang" / "ja_jp.json",
+                {"accessibility.button": "設定"},
+            )
+            _write_json(
+                tmp_path / "manifest.json",
+                {
+                    "pack": {"description": "test pack", "pack_format": 34},
+                    "build": {
+                        "include_generated_by_default": True,
+                        "include_pending_by_default": True,
+                    },
+                    "sources": [
+                        {
+                            "id": "local-minecraft",
+                            "type": "local_dir",
+                            "path": str(source_root),
+                            "include_globs": ["**/assets/*/lang/ja_jp.json"],
+                        }
+                    ],
+                },
+            )
+            _write_json(tmp_path / "review" / "glossary.json", {"terms": []})
+            _write_json(tmp_path / "review" / "review_entries.json", {})
+
+            summary = run(tmp_path / "manifest.json", tmp_path)
+            built = json.loads(
+                (tmp_path / "build" / "resourcepack" / "assets" / "minecraft" / "lang" / "ja_jp.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            self.assertTrue(summary["build"]["include_pending"])
+            self.assertEqual(built["accessibility.button"], "§^設定(せってい)")
+
+    def test_pipeline_auto_annotates_with_installed_analyzers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            source_root = tmp_path / "fixtures"
+            _write_json(
+                source_root / "assets" / "minecraft" / "lang" / "ja_jp.json",
+                {"adv.title": "冒険の時間"},
+            )
+            _write_json(
+                tmp_path / "manifest.json",
+                {
+                    "pack": {"description": "test pack", "pack_format": 34},
+                    "build": {
+                        "include_generated_by_default": True,
+                        "include_pending_by_default": True,
+                    },
+                    "sources": [
+                        {
+                            "id": "local-minecraft",
+                            "type": "local_dir",
+                            "path": str(source_root),
+                            "include_globs": ["**/assets/*/lang/ja_jp.json"],
+                        }
+                    ],
+                },
+            )
+            _write_json(tmp_path / "review" / "glossary.json", {"terms": []})
+            _write_json(tmp_path / "review" / "review_entries.json", {})
+
+            summary = run(tmp_path / "manifest.json", tmp_path)
+            built = json.loads(
+                (tmp_path / "build" / "resourcepack" / "assets" / "minecraft" / "lang" / "ja_jp.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            self.assertIn(summary["annotate"]["status_counts"], ({"generated": 1}, {"pending": 1}))
+            self.assertEqual(built["adv.title"], "§^冒険(ぼうけん)の§^時間(じかん)")
+
+    def test_report_includes_review_category_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            _write_json(tmp_path / "build" / "annotated_records.json", [])
+            _write_json(
+                tmp_path / "review" / "generated" / "review_candidates.json",
+                {
+                    "candidate_count": 2,
+                    "candidates": {
+                        "minecraft:a": {
+                            "category": "compound_or_lexical_conflict",
+                            "source_text": "村人",
+                            "current_text": "村人",
+                            "reason": "analyzer_conflict",
+                            "options": [],
+                            "source_origin": "test",
+                        },
+                        "minecraft:b": {
+                            "category": "unresolved_counter_or_numeric_conflict",
+                            "source_text": "2匹",
+                            "current_text": "2匹",
+                            "reason": "analyzer_conflict",
+                            "options": [],
+                            "source_origin": "test",
+                        },
+                    },
+                },
+            )
+            _write_json(
+                tmp_path / "review" / "generated" / "review_candidates_by_category.json",
+                {
+                    "category_counts": {
+                        "compound_or_lexical_conflict": 1,
+                        "unresolved_counter_or_numeric_conflict": 1,
+                    },
+                    "categories": {
+                        "compound_or_lexical_conflict": {"minecraft:a": {}},
+                        "unresolved_counter_or_numeric_conflict": {"minecraft:b": {}},
+                    },
+                },
+            )
+
+            summary = report(tmp_path)
+
+            self.assertEqual(summary["review_candidate_count"], 2)
+            self.assertEqual(summary["review_category_counts"]["compound_or_lexical_conflict"], 1)
+            self.assertEqual(summary["review_category_counts"]["unresolved_counter_or_numeric_conflict"], 1)

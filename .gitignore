@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+
+build/
+review/
+
+.venv-jmdict
+
+.codex
+task.md

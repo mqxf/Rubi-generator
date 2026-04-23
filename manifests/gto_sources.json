@@ -1,0 +1,48 @@
+{
+  "pack": {
+    "description": "Rubi GTO generated Japanese pack",
+    "pack_format": 34
+  },
+  "defaults": {
+    "github_owner": "GregTech-Odyssey",
+    "include_globs": [
+      "**/assets/*/lang/ja_jp.json"
+    ]
+  },
+  "sources": [
+    {
+      "id": "minecraft-vanilla-1.20.1",
+      "type": "minecraft_assets",
+      "minecraft_version": "1.20.1",
+      "locale": "ja_jp",
+      "target_namespace": "minecraft"
+    },
+    {
+      "id": "gregtech-modern",
+      "type": "github_repo_archive",
+      "repo": "GregTech-Modern",
+      "ref": "gto",
+      "include_globs": [
+        "src/main/resources/assets/*/lang/ja_jp.json"
+      ]
+    },
+    {
+      "id": "applied-energistics-2-gto",
+      "type": "github_repo_archive",
+      "repo": "Applied-Energistics-2-gto",
+      "ref": "gto",
+      "include_globs": [
+        "src/main/resources/assets/*/lang/ja_jp.json"
+      ]
+    },
+    {
+      "id": "gto-translations",
+      "type": "github_repo_archive",
+      "repo": "GTO-Translations",
+      "ref": "main",
+      "include_globs": [
+        "ja_jp/resourcepacks/gto-lang-ja_jp/assets/*/lang/ja_jp.json"
+      ]
+    }
+  ]
+}
