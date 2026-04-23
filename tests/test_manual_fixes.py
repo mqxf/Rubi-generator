@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from rubi_gto.manual_fix_llm import GENERATED_MANUAL_FIX_LLM_REPORT_PATH, autofill_manual_fix_overrides
 from rubi_gto.manual_fixes import (
     GENERATED_MANUAL_FIX_CANDIDATES_PATH,
     GENERATED_MANUAL_FIX_OVERRIDES_PATH,
@@ -16,6 +17,35 @@ from rubi_gto.pipeline import annotate, ingest
 def _write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+class FakeManualFixClient:
+    def __init__(self, responses: list[dict[str, object]]) -> None:
+        self._responses = list(responses)
+        self.requests: list[dict[str, object]] = []
+
+    def create_structured_response(
+        self,
+        *,
+        model: str,
+        instructions: str,
+        input_text: str,
+        schema_name: str,
+        schema: dict[str, object],
+        reasoning_effort: str | None,
+        max_output_tokens: int,
+    ) -> dict[str, object]:
+        self.requests.append(
+            {
+                "model": model,
+                "instructions": instructions,
+                "input_text": input_text,
+                "schema_name": schema_name,
+                "reasoning_effort": reasoning_effort,
+                "max_output_tokens": max_output_tokens,
+            }
+        )
+        return self._responses.pop(0)
 
 
 class ManualFixTests(unittest.TestCase):
@@ -135,3 +165,232 @@ class ManualFixTests(unittest.TestCase):
             self.assertEqual(suggestions["minecraft:menu.singleplayer"]["source"], "manual-fix")
             self.assertEqual(built["menu.singleplayer"], "§^一人(ひとり)で§^遊(あそ)ぶ")
 
+    def test_autofill_manual_fix_overrides_preserves_existing_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            _write_json(
+                tmp_path / GENERATED_MANUAL_FIX_CANDIDATES_PATH,
+                {
+                    "entry_count": 2,
+                    "entries": {
+                        "minecraft:a": {
+                            "key": "a",
+                            "original_text": "村人",
+                            "fugashi_version": "§^村(そん)§^人(じん)",
+                            "sudachi_version": "§^村人(むらびと)",
+                            "current_text": "村人",
+                            "category": "compound_or_lexical_conflict",
+                            "llm_status": "error",
+                            "llm_error": "",
+                        },
+                        "minecraft:b": {
+                            "key": "b",
+                            "original_text": "取引",
+                            "fugashi_version": "§^取引(とりひき)",
+                            "sudachi_version": "§^取引(とりひき)",
+                            "current_text": "取引",
+                            "category": "reading_only_conflict",
+                            "llm_status": "unreviewed",
+                            "llm_error": "",
+                        },
+                    },
+                },
+            )
+            _write_json(
+                tmp_path / GENERATED_MANUAL_FIX_OVERRIDES_PATH,
+                {"minecraft:a": "§^村人(むらびと)", "minecraft:b": ""},
+            )
+            client = FakeManualFixClient(
+                [
+                    {"annotated_text": "§^取引(とりひき)"},
+                ]
+            )
+
+            summary = autofill_manual_fix_overrides(tmp_path, client=client)
+
+            overrides = json.loads((tmp_path / GENERATED_MANUAL_FIX_OVERRIDES_PATH).read_text(encoding="utf-8"))
+            report = json.loads((tmp_path / GENERATED_MANUAL_FIX_LLM_REPORT_PATH).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status_counts"]["preserved_existing"], 1)
+            self.assertEqual(len(client.requests), 1)
+            self.assertEqual(client.requests[0]["model"], "gpt-4.1")
+            self.assertEqual(client.requests[0]["max_output_tokens"], 32768)
+            self.assertEqual(overrides["minecraft:a"], "§^村人(むらびと)")
+            self.assertEqual(overrides["minecraft:b"], "§^取引(とりひき)")
+            self.assertEqual(report["status_counts"]["filled"], 1)
+
+    def test_autofill_manual_fix_overrides_uses_repair_model_for_invalid_annotations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            _write_json(
+                tmp_path / GENERATED_MANUAL_FIX_CANDIDATES_PATH,
+                {
+                    "entry_count": 1,
+                    "entries": {
+                        "minecraft:a": {
+                            "key": "a",
+                            "original_text": "一人で遊ぶ",
+                            "fugashi_version": "§^一人(ひとり)で§^遊(あそ)ぶ",
+                            "sudachi_version": "§^一人(いちにん)で§^遊(ゆう)ぶ",
+                            "current_text": "一人で遊ぶ",
+                            "category": "compound_or_lexical_conflict",
+                            "llm_status": "error",
+                            "llm_error": "invalid_annotation",
+                        }
+                    },
+                },
+            )
+            _write_json(tmp_path / GENERATED_MANUAL_FIX_OVERRIDES_PATH, {"minecraft:a": ""})
+            client = FakeManualFixClient([{"annotated_text": "§^一人(ひとり)で§^遊(あそ)ぶ"}])
+
+            summary = autofill_manual_fix_overrides(
+                tmp_path,
+                client=client,
+                model="gpt-4.1",
+                repair_model="gpt-5",
+                repair_reasoning_effort="high",
+            )
+
+            overrides = json.loads((tmp_path / GENERATED_MANUAL_FIX_OVERRIDES_PATH).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status_counts"]["filled"], 1)
+            self.assertEqual(client.requests[0]["model"], "gpt-5")
+            self.assertEqual(client.requests[0]["reasoning_effort"], "high")
+            self.assertEqual(client.requests[0]["max_output_tokens"], 32768)
+            self.assertIn("prior attempt failed validation", client.requests[0]["instructions"].lower())
+            self.assertEqual(overrides["minecraft:a"], "§^一人(ひとり)で§^遊(あそ)ぶ")
+
+    def test_autofill_manual_fix_overrides_uses_repair_model_for_any_prior_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            _write_json(
+                tmp_path / GENERATED_MANUAL_FIX_CANDIDATES_PATH,
+                {
+                    "entry_count": 1,
+                    "entries": {
+                        "minecraft:a": {
+                            "key": "a",
+                            "original_text": "村人",
+                            "fugashi_version": "§^村(そん)§^人(じん)",
+                            "sudachi_version": "§^村人(むらびと)",
+                            "current_text": "村人",
+                            "category": "compound_or_lexical_conflict",
+                            "llm_status": "error",
+                            "llm_error": "request_timeout",
+                        }
+                    },
+                },
+            )
+            _write_json(tmp_path / GENERATED_MANUAL_FIX_OVERRIDES_PATH, {"minecraft:a": ""})
+            client = FakeManualFixClient([{"annotated_text": "§^村人(むらびと)"}])
+
+            summary = autofill_manual_fix_overrides(tmp_path, client=client)
+
+            overrides = json.loads((tmp_path / GENERATED_MANUAL_FIX_OVERRIDES_PATH).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status_counts"]["filled"], 1)
+            self.assertEqual(client.requests[0]["model"], "gpt-5")
+            self.assertEqual(client.requests[0]["reasoning_effort"], "high")
+            self.assertEqual(overrides["minecraft:a"], "§^村人(むらびと)")
+
+    def test_autofill_manual_fix_overrides_accepts_missing_kanji_for_manual_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            _write_json(
+                tmp_path / GENERATED_MANUAL_FIX_CANDIDATES_PATH,
+                {
+                    "entry_count": 1,
+                    "entries": {
+                        "minecraft:a": {
+                            "key": "a",
+                            "original_text": "村人と取引をする",
+                            "fugashi_version": "§^村人(むらびと)と§^取引(とりひき)をする",
+                            "sudachi_version": "§^村(そん)§^人(じん)と§^取引(とりひき)をする",
+                            "current_text": "村人と取引をする",
+                            "category": "compound_or_lexical_conflict",
+                            "llm_status": "unreviewed",
+                            "llm_error": "",
+                        }
+                    },
+                },
+            )
+            _write_json(tmp_path / GENERATED_MANUAL_FIX_OVERRIDES_PATH, {"minecraft:a": ""})
+            client = FakeManualFixClient([{"annotated_text": "村人と§^取引(とりひき)をする"}])
+
+            summary = autofill_manual_fix_overrides(tmp_path, client=client)
+
+            overrides = json.loads((tmp_path / GENERATED_MANUAL_FIX_OVERRIDES_PATH).read_text(encoding="utf-8"))
+            report = json.loads((tmp_path / GENERATED_MANUAL_FIX_LLM_REPORT_PATH).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status_counts"]["filled_with_missing_kanji"], 1)
+            self.assertEqual(overrides["minecraft:a"], "村人と§^取引(とりひき)をする")
+            self.assertEqual(report["results"]["minecraft:a"]["status"], "filled_with_missing_kanji")
+            self.assertEqual(report["results"]["minecraft:a"]["validation_issues"], ["unannotated_kanji"])
+
+    def test_autofill_manual_fix_overrides_retries_with_repair_model_after_first_pass_failure(self) -> None:
+        class RetryClient:
+            def __init__(self) -> None:
+                self.requests: list[dict[str, object]] = []
+
+            def create_structured_response(
+                self,
+                *,
+                model: str,
+                instructions: str,
+                input_text: str,
+                schema_name: str,
+                schema: dict[str, object],
+                reasoning_effort: str | None,
+                max_output_tokens: int,
+            ) -> dict[str, object]:
+                self.requests.append(
+                    {
+                        "model": model,
+                        "instructions": instructions,
+                        "reasoning_effort": reasoning_effort,
+                        "max_output_tokens": max_output_tokens,
+                    }
+                )
+                if len(self.requests) == 1:
+                    raise RuntimeError("first pass blew up")
+                return {"annotated_text": "§^村人(むらびと)"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_path = Path(temp_dir)
+            _write_json(
+                tmp_path / GENERATED_MANUAL_FIX_CANDIDATES_PATH,
+                {
+                    "entry_count": 1,
+                    "entries": {
+                        "minecraft:a": {
+                            "key": "a",
+                            "original_text": "村人",
+                            "fugashi_version": "§^村(そん)§^人(じん)",
+                            "sudachi_version": "§^村人(むらびと)",
+                            "current_text": "村人",
+                            "category": "compound_or_lexical_conflict",
+                            "llm_status": "unreviewed",
+                            "llm_error": "",
+                        }
+                    },
+                },
+            )
+            _write_json(tmp_path / GENERATED_MANUAL_FIX_OVERRIDES_PATH, {"minecraft:a": ""})
+            client = RetryClient()
+
+            summary = autofill_manual_fix_overrides(tmp_path, client=client)
+
+            overrides = json.loads((tmp_path / GENERATED_MANUAL_FIX_OVERRIDES_PATH).read_text(encoding="utf-8"))
+            report = json.loads((tmp_path / GENERATED_MANUAL_FIX_LLM_REPORT_PATH).read_text(encoding="utf-8"))
+
+            self.assertEqual(summary["status_counts"]["filled"], 1)
+            self.assertEqual(len(client.requests), 2)
+            self.assertEqual(client.requests[0]["model"], "gpt-4.1")
+            self.assertEqual(client.requests[0]["reasoning_effort"], None)
+            self.assertEqual(client.requests[0]["max_output_tokens"], 32768)
+            self.assertEqual(client.requests[1]["model"], "gpt-5")
+            self.assertEqual(client.requests[1]["reasoning_effort"], "high")
+            self.assertEqual(client.requests[1]["max_output_tokens"], 32768)
+            self.assertEqual(overrides["minecraft:a"], "§^村人(むらびと)")
+            self.assertEqual(report["results"]["minecraft:a"]["final_phase"], "repair_fallback")
+            self.assertEqual(report["results"]["minecraft:a"]["attempts"][0]["status"], "error")

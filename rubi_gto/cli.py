@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .llm_review import llm_review
+from .manual_fix_llm import autofill_manual_fix_overrides
 from .manual_fixes import apply_manual_fix_overrides, export_manual_fix_candidates
 from .pipeline import annotate, build, ingest, report, run
 from .progress import ConsoleProgress
@@ -60,6 +61,19 @@ def _parser() -> argparse.ArgumentParser:
 
     export_manual = subparsers.add_parser("export-manual-fixes")
     export_manual.add_argument("--workspace", type=Path, default=Path("."))
+
+    autofill_manual = subparsers.add_parser("autofill-manual-fixes")
+    autofill_manual.add_argument("--workspace", type=Path, default=Path("."))
+    autofill_manual.add_argument("--model", default="gpt-4.1")
+    autofill_manual.add_argument("--repair-model", default="gpt-5")
+    autofill_manual.add_argument("--repair-reasoning-effort", default="high")
+    autofill_manual.add_argument("--max-output-tokens", type=int, default=32768)
+    autofill_manual.add_argument("--repair-max-output-tokens", type=int, default=32768)
+    autofill_manual.add_argument("--overwrite-existing", action="store_true")
+    autofill_manual.add_argument("--base-url")
+    autofill_manual.add_argument("--max-rate-limit-retries", type=int, default=4)
+    autofill_manual.add_argument("--min-request-interval-seconds", type=float, default=0.0)
+    autofill_manual.add_argument("--request-timeout-seconds", type=float, default=20.0)
 
     merge_manual = subparsers.add_parser("merge-manual-fixes")
     merge_manual.add_argument("--manifest", type=Path, required=True)
@@ -193,6 +207,21 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.command == "export-manual-fixes":
         payload = export_manual_fix_candidates(workspace, progress=progress)
+    elif args.command == "autofill-manual-fixes":
+        payload = autofill_manual_fix_overrides(
+            workspace,
+            model=args.model,
+            repair_model=args.repair_model,
+            repair_reasoning_effort=args.repair_reasoning_effort,
+            max_output_tokens=args.max_output_tokens,
+            repair_max_output_tokens=args.repair_max_output_tokens,
+            overwrite_existing=args.overwrite_existing,
+            base_url=args.base_url,
+            max_rate_limit_retries=args.max_rate_limit_retries,
+            min_request_interval_seconds=args.min_request_interval_seconds,
+            request_timeout_seconds=args.request_timeout_seconds,
+            progress=progress,
+        )
     elif args.command == "merge-manual-fixes":
         payload = apply_manual_fix_overrides(
             workspace,

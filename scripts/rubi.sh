@@ -19,6 +19,7 @@ Usage:
   ./scripts/rubi.sh conflicts
   ./scripts/rubi.sh llm [llm-review args...]
   ./scripts/rubi.sh export-manual-fixes
+  ./scripts/rubi.sh autofill-manual-fixes [autofill args...]
   ./scripts/rubi.sh merge-manual-fixes [manifest] [fixes]
   ./scripts/rubi.sh merge [manifest]
   ./scripts/rubi.sh final [manifest]
@@ -88,6 +89,14 @@ llm_stage() {
 
 export_manual_fixes_stage() {
   python3 -m rubi_gto export-manual-fixes --workspace "$WORKSPACE"
+}
+
+autofill_manual_fixes_stage() {
+  if [[ $# -eq 0 ]]; then
+    python3 -m rubi_gto autofill-manual-fixes --workspace "$WORKSPACE"
+  else
+    python3 -m rubi_gto autofill-manual-fixes --workspace "$WORKSPACE" "$@"
+  fi
 }
 
 merge_manual_fixes_stage() {
@@ -182,6 +191,9 @@ case "$command" in
     ;;
   export-manual-fixes)
     export_manual_fixes_stage
+    ;;
+  autofill-manual-fixes)
+    autofill_manual_fixes_stage "$@"
     ;;
   merge-manual-fixes)
     merge_manual_fixes_stage "$@"
