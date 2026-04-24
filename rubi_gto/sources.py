@@ -45,6 +45,7 @@ DEFAULT_PATCHOULI_DATA_INCLUDE_GLOBS = ["data/*/patchouli_books/**"]
 FTBQUESTS_DIR_NAMES = {"ftbquests", "ftb_quests"}
 FTBQUESTS_ROOT_NAMES = {"quests", "normal"}
 GTO_TRANSLATIONS_PRIORITY_NAMESPACES = {"gto", "gtocore", "gto_core"}
+GTM_PRIORITY_NAMESPACES = {"gtceu", "gregtech", "gtmodern"}
 GUIDE_TEXT_SUFFIXES = {".md", ".txt"}
 PATCHOULI_JSON_SUFFIXES = {".json", ".json5"}
 PATCHOULI_TEXT_SUFFIXES = {".md", ".txt"}
@@ -2122,9 +2123,10 @@ def _selected_gto_translation_repo_sources(
     repo_root: Path,
     *,
     locale: str,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[str]]:
     selected_sources: list[dict[str, Any]] = []
     discoveries: list[dict[str, Any]] = []
+    selected_namespace_set: set[str] = set()
     for local_repo in _direct_repo_roots(repo_root):
         if not _is_gto_translations_repo(local_repo):
             continue
@@ -2140,14 +2142,15 @@ def _selected_gto_translation_repo_sources(
                 for namespace in source.get("detected_namespaces", [])
                 if str(namespace).strip()
             }
-            selected_namespaces = sorted(detected_namespaces & GTO_TRANSLATIONS_PRIORITY_NAMESPACES)
-            if not selected_namespaces:
+            matching_namespaces = sorted(detected_namespaces & GTO_TRANSLATIONS_PRIORITY_NAMESPACES)
+            if not matching_namespaces:
                 continue
             source["merge_priority"] = 30
-            source["include_namespaces"] = selected_namespaces
+            source["include_namespaces"] = matching_namespaces
             source["source_role"] = "gto_translations_priority_lang"
             selected_sources.append(source)
             selected_from_repo += 1
+            selected_namespace_set.update(matching_namespaces)
         discoveries.append(
             {
                 "repo_root": str(local_repo.resolve()),
@@ -2155,7 +2158,70 @@ def _selected_gto_translation_repo_sources(
                 "selected_source_count": selected_from_repo,
             }
         )
-    return selected_sources, discoveries
+    return selected_sources, discoveries, selected_namespace_set
+
+
+def _is_gregtech_modern_repo(repo_root: Path) -> bool:
+    tokens = _tokenize_label(repo_root.name)
+    normalized = _normalize_label(repo_root.name)
+    return (
+        ("gregtech" in tokens and "modern" in tokens)
+        or "gregtechmodern" in normalized
+        or "gtmodern" in tokens
+    )
+
+
+def _selected_gtm_repo_sources(
+    repo_root: Path,
+    *,
+    pack_description: str,
+    pack_format: int,
+    minecraft_version: str,
+    locale: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[str]]:
+    selected_sources: list[dict[str, Any]] = []
+    discoveries: list[dict[str, Any]] = []
+    selected_namespaces: set[str] = set()
+    for local_repo in _direct_repo_roots(repo_root):
+        if not _is_gregtech_modern_repo(local_repo):
+            continue
+        local_manifest = build_local_manifest(
+            local_repo,
+            pack_description=pack_description,
+            pack_format=pack_format,
+            include_vanilla=False,
+            minecraft_version=minecraft_version,
+            locale=locale,
+        )
+        local_sources = [
+            source
+            for source in list(local_manifest.get("sources", []))
+            if not _source_is_resourcepack_only_repo_source(source)
+        ]
+        selected_from_repo = 0
+        for source in local_sources:
+            detected_namespaces = {
+                str(namespace).strip().lower()
+                for namespace in source.get("detected_namespaces", [])
+                if str(namespace).strip()
+            }
+            matching_namespaces = sorted(detected_namespaces & GTM_PRIORITY_NAMESPACES)
+            if not matching_namespaces:
+                continue
+            source["merge_priority"] = 25
+            source["include_namespaces"] = matching_namespaces
+            source["source_role"] = "gregtech_modern_priority_lang"
+            selected_sources.append(source)
+            selected_from_repo += 1
+            selected_namespaces.update(matching_namespaces)
+        discoveries.append(
+            {
+                "repo_root": str(local_repo.resolve()),
+                "local_manifest_source_count": len(local_sources),
+                "selected_source_count": selected_from_repo,
+            }
+        )
+    return selected_sources, discoveries, selected_namespaces
 
 
 def _instance_mod_archive_sources(
@@ -2188,8 +2254,25 @@ def build_gto_workflow_manifest(
 ) -> dict[str, Any]:
     instance_root = instance_root.resolve()
     repo_root = repo_root.resolve()
-    repo_sources, repo_discovery = _selected_gto_translation_repo_sources(repo_root, locale=locale)
+    gto_repo_sources, gto_repo_discovery, gto_priority_namespaces = _selected_gto_translation_repo_sources(
+        repo_root,
+        locale=locale,
+    )
+    gtm_repo_sources, gtm_repo_discovery, gtm_priority_namespaces = _selected_gtm_repo_sources(
+        repo_root,
+        pack_description=pack_description,
+        pack_format=pack_format,
+        minecraft_version=minecraft_version,
+        locale=locale,
+    )
+    repo_sources = gto_repo_sources + gtm_repo_sources
+    priority_repo_namespaces = gto_priority_namespaces | gtm_priority_namespaces
     instance_sources, instance_mods = _instance_mod_archive_sources(instance_root, locale=locale)
+    for source in instance_sources:
+        source["exclude_namespaces"] = sorted(
+            set(str(namespace).strip().lower() for namespace in source.get("exclude_namespaces", []))
+            | priority_repo_namespaces
+        )
 
     sources: list[dict[str, Any]] = []
     if include_vanilla:
@@ -2223,7 +2306,11 @@ def build_gto_workflow_manifest(
             "merge_rule": "gto_translations_repo_supplies_gto_namespaces_instance_mod_archives_supply_everything_else",
         },
         "discovery": {
-            "repo_sources": repo_discovery,
+            "repo_sources": {
+                "gto_translations": gto_repo_discovery,
+                "gregtech_modern": gtm_repo_discovery,
+                "priority_namespaces": sorted(priority_repo_namespaces),
+            },
             "instance_mod_archives": instance_mods,
             "skipped_instance_content_roots": [
                 "config/ftbquests/quests",

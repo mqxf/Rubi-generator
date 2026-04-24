@@ -343,6 +343,11 @@ class DiscoveryTests(unittest.TestCase):
                 mods_toml='[[mods]]\nmodId = "othermod"\n',
                 files={"assets/othermod/lang/ja_jp.json": json.dumps({"other.key": "別翻訳"}, ensure_ascii=False)},
             )
+            _write_archive(
+                instance_root / "mods" / "gtceu.jar",
+                mods_toml='[[mods]]\nmodId = "gtceu"\n',
+                files={"assets/gtceu/lang/ja_jp.json": json.dumps({"machine.name": "instance gtceu"}, ensure_ascii=False)},
+            )
             _write_json(
                 instance_root / "resourcepacks" / "instancepack" / "pack.mcmeta",
                 {"pack": {"description": "Instance pack", "pack_format": 34}},
@@ -403,10 +408,15 @@ class DiscoveryTests(unittest.TestCase):
                 "gto_translations_repo_supplies_gto_namespaces_instance_mod_archives_supply_everything_else",
             )
             self.assertTrue(any(source["merge_priority"] == 20 for source in manifest["sources"]))
+            self.assertTrue(any(source["merge_priority"] == 25 for source in manifest["sources"]))
             self.assertTrue(any(source["merge_priority"] == 30 for source in manifest["sources"]))
             self.assertTrue(any(source["id"] == "othermod" for source in manifest["sources"]))
             repo_source = next(source for source in manifest["sources"] if source["id"].startswith("repo-pack:GTO-Translations"))
             self.assertEqual(sorted(repo_source["include_namespaces"]), ["gto", "gtocore"])
+            gtm_source = next(source for source in manifest["sources"] if source["id"] == "GregTech-Modern")
+            self.assertEqual(gtm_source["include_namespaces"], ["gtceu"])
             othermod_source = next(source for source in manifest["sources"] if source["id"] == "othermod")
-            self.assertEqual(sorted(othermod_source["exclude_namespaces"]), ["gto", "gto_core", "gtocore"])
+            self.assertEqual(sorted(othermod_source["exclude_namespaces"]), ["gtceu", "gto", "gto_core", "gtocore"])
+            gtceu_source = next(source for source in manifest["sources"] if source["id"] == "gtceu")
+            self.assertEqual(sorted(gtceu_source["exclude_namespaces"]), ["gtceu", "gto", "gto_core", "gtocore"])
             self.assertFalse(any(source["id"].startswith("ftbquests:") for source in manifest["sources"]))

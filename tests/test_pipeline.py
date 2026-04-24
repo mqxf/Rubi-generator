@@ -917,11 +917,28 @@ class PipelineTests(unittest.TestCase):
                     )
                 },
             )
+            _write_archive(
+                instance_root / "mods" / "gtceu.jar",
+                mods_toml='[[mods]]\nmodId = "gtceu"\n',
+                files={
+                    "assets/gtceu/lang/ja_jp.json": json.dumps(
+                        {"machine.name": "インスタンスGT", "instance.gtceu.only": "現地GT"},
+                        ensure_ascii=False,
+                    )
+                },
+            )
             (instance_root / "config" / "ftbquests" / "quests").mkdir(parents=True, exist_ok=True)
             (instance_root / "config" / "ftbquests" / "quests" / "data.snbt").write_text("{}", encoding="utf-8")
             _write_json(
                 instance_root / "config" / "openloader" / "resources" / "quests" / "pack.mcmeta",
                 {"pack": {"description": "Quest pack", "pack_format": 34}},
+            )
+
+            gregtech_modern_repo = root / "GregTech-Modern"
+            (gregtech_modern_repo / ".git").mkdir(parents=True, exist_ok=True)
+            _write_json(
+                gregtech_modern_repo / "src" / "main" / "resources" / "assets" / "gtceu" / "lang" / "ja_jp.json",
+                {"machine.name": "リポジトリGT", "repo.gtceu.only": "翻訳GT"},
             )
 
             translations_repo = root / "GTO-Translations"
@@ -975,6 +992,11 @@ class PipelineTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
+            gtceu = json.loads(
+                (root / "build" / "resourcepack" / "assets" / "gtceu" / "lang" / "ja_jp.json").read_text(
+                    encoding="utf-8"
+                )
+            )
 
             self.assertEqual(summary["build"]["target_layout"], "resourcepack")
             self.assertEqual(strip_rubi(merged["dup.key"]), "リポジトリ")
@@ -982,6 +1004,9 @@ class PipelineTests(unittest.TestCase):
             self.assertNotIn("instance.only", merged)
             self.assertEqual(strip_rubi(other["other.key"]), "別翻訳")
             self.assertEqual(strip_rubi(core["core.key"]), "中核翻訳")
+            self.assertEqual(strip_rubi(gtceu["machine.name"]), "リポジトリGT")
+            self.assertEqual(strip_rubi(gtceu["repo.gtceu.only"]), "翻訳GT")
+            self.assertNotIn("instance.gtceu.only", gtceu)
 
     def test_ftbquests_locale_snbt_overwrite_and_full_pack_block(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
