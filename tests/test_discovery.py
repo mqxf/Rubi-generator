@@ -333,11 +333,16 @@ class DiscoveryTests(unittest.TestCase):
                 any(source["output_kind"] == "openloader" for source in manifest["sources"][1:])
             )
 
-    def test_builds_gto_workflow_manifest_with_repo_and_instance_sources(self) -> None:
+    def test_builds_gto_workflow_manifest_with_repo_priority_gto_lang_and_instance_mods_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             instance_root = root / "GregTech-Odyssey"
             (instance_root / ".git").mkdir(parents=True, exist_ok=True)
+            _write_archive(
+                instance_root / "mods" / "othermod.jar",
+                mods_toml='[[mods]]\nmodId = "othermod"\n',
+                files={"assets/othermod/lang/ja_jp.json": json.dumps({"other.key": "別翻訳"}, ensure_ascii=False)},
+            )
             _write_json(
                 instance_root / "resourcepacks" / "instancepack" / "pack.mcmeta",
                 {"pack": {"description": "Instance pack", "pack_format": 34}},
@@ -371,6 +376,19 @@ class DiscoveryTests(unittest.TestCase):
                 / "ja_jp.json",
                 {"dup": "repo"},
             )
+            _write_json(
+                translations_repo
+                / "ja_jp"
+                / "resourcepacks"
+                / "gto-lang-ja_jp"
+                / "assets"
+                / "gtocore"
+                / "lang"
+                / "ja_jp.json",
+                {"core": "repo"},
+            )
+            (instance_root / "config" / "ftbquests" / "quests").mkdir(parents=True, exist_ok=True)
+            (instance_root / "config" / "ftbquests" / "quests" / "data.snbt").write_text("{}", encoding="utf-8")
 
             manifest = build_gto_workflow_manifest(
                 instance_root,
@@ -379,8 +397,16 @@ class DiscoveryTests(unittest.TestCase):
                 pack_format=34,
             )
 
-            self.assertEqual(manifest["workflow"]["merge_rule"], "instance_wins_on_duplicate_output_keys")
-            self.assertTrue(any(source["merge_priority"] == 10 for source in manifest["sources"]))
+            self.assertEqual(manifest["build"]["target_layout"], "resourcepack")
+            self.assertEqual(
+                manifest["workflow"]["merge_rule"],
+                "gto_translations_repo_supplies_gto_namespaces_instance_mod_archives_supply_everything_else",
+            )
             self.assertTrue(any(source["merge_priority"] == 20 for source in manifest["sources"]))
-            self.assertTrue(any(source["id"] == "GregTech-Modern" for source in manifest["sources"]))
-            self.assertTrue(any(source["id"].startswith("repo-pack:GTO-Translations") for source in manifest["sources"]))
+            self.assertTrue(any(source["merge_priority"] == 30 for source in manifest["sources"]))
+            self.assertTrue(any(source["id"] == "othermod" for source in manifest["sources"]))
+            repo_source = next(source for source in manifest["sources"] if source["id"].startswith("repo-pack:GTO-Translations"))
+            self.assertEqual(sorted(repo_source["include_namespaces"]), ["gto", "gtocore"])
+            othermod_source = next(source for source in manifest["sources"] if source["id"] == "othermod")
+            self.assertEqual(sorted(othermod_source["exclude_namespaces"]), ["gto", "gto_core", "gtocore"])
+            self.assertFalse(any(source["id"].startswith("ftbquests:") for source in manifest["sources"]))

@@ -44,6 +44,7 @@ DEFAULT_PATCHOULI_ASSET_INCLUDE_GLOBS = ["assets/*/patchouli_books/**"]
 DEFAULT_PATCHOULI_DATA_INCLUDE_GLOBS = ["data/*/patchouli_books/**"]
 FTBQUESTS_DIR_NAMES = {"ftbquests", "ftb_quests"}
 FTBQUESTS_ROOT_NAMES = {"quests", "normal"}
+GTO_TRANSLATIONS_PRIORITY_NAMESPACES = {"gto", "gtocore", "gto_core"}
 GUIDE_TEXT_SUFFIXES = {".md", ".txt"}
 PATCHOULI_JSON_SUFFIXES = {".json", ".json5"}
 PATCHOULI_TEXT_SUFFIXES = {".md", ".txt"}
@@ -214,6 +215,8 @@ def _records_from_json(
     namespace = _derive_lang_namespace(path, source.target_namespace) if source.json_mode == "lang" else source.target_namespace
     if not namespace:
         raise ValueError(f"source {source.id} requires target_namespace for json_mode={source.json_mode}")
+    if not _namespace_allowed_for_source(source, namespace):
+        return []
     if source.json_mode == "lang":
         if not isinstance(payload, dict):
             raise ValueError(f"source {source.id} expected a JSON object at {path}")
@@ -258,6 +261,8 @@ def _text_record(
     if not _looks_like_japanese_locale_path(path) and not _contains_japanese(text):
         return None
     namespace = _derive_lang_namespace(path, source.target_namespace or source.id)
+    if not _namespace_allowed_for_source(source, namespace):
+        return None
     return Record(
         namespace=namespace,
         key=path,
@@ -288,6 +293,8 @@ def _records_from_generic_json(
     if _has_explicit_non_japanese_locale_path(path):
         return []
     namespace = _derive_lang_namespace(path, source.target_namespace or source.id)
+    if not _namespace_allowed_for_source(source, namespace):
+        return []
     entries = _json_string_entries(payload)
     if not entries:
         return []
@@ -445,6 +452,21 @@ def _namespaces_from_asset_paths(paths: list[str]) -> list[str]:
         except ValueError:
             continue
     return sorted(namespaces)
+
+
+def _namespace_filter(values: Any) -> set[str]:
+    if not isinstance(values, list):
+        return set()
+    return {str(value).strip().lower() for value in values if str(value).strip()}
+
+
+def _namespace_allowed_for_source(source: SourceSpec, namespace: str) -> bool:
+    normalized = namespace.strip().lower()
+    include_namespaces = _namespace_filter(source.extra.get("include_namespaces"))
+    exclude_namespaces = _namespace_filter(source.extra.get("exclude_namespaces"))
+    if include_namespaces and normalized not in include_namespaces:
+        return False
+    return normalized not in exclude_namespaces
 
 
 def _patchouli_book_names(paths: list[str]) -> list[str]:
@@ -1805,6 +1827,8 @@ def _instance_source_from_entry(entry: dict[str, Any], *, output_kind: str, outp
         "locale": "ja_jp",
         "content_kinds": ["lang_json", "guide_text", "patchouli_json", "patchouli_text"],
         "portability": "portable" if output_kind != "instance" else "overwrite_only",
+        "detected_namespaces": list(entry.get("detected_namespaces", [])),
+        "detected_files": list(entry.get("detected_files", [])),
     }
     if output_kind != "instance":
         payload["full_pack_output_root"] = "resourcepack"
@@ -2088,6 +2112,70 @@ def _discover_repo_resourcepack_sources(
     return sources, discoveries
 
 
+def _is_gto_translations_repo(repo_root: Path) -> bool:
+    tokens = _tokenize_label(repo_root.name)
+    normalized = _normalize_label(repo_root.name)
+    return ("gto" in tokens and ("translation" in tokens or "translations" in tokens)) or "gtotranslation" in normalized
+
+
+def _selected_gto_translation_repo_sources(
+    repo_root: Path,
+    *,
+    locale: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    selected_sources: list[dict[str, Any]] = []
+    discoveries: list[dict[str, Any]] = []
+    for local_repo in _direct_repo_roots(repo_root):
+        if not _is_gto_translations_repo(local_repo):
+            continue
+        pack_sources, pack_discoveries = _discover_repo_resourcepack_sources(
+            local_repo,
+            locale=locale,
+            source_prefix=f"repo-pack:{local_repo.name}",
+        )
+        selected_from_repo = 0
+        for source in pack_sources:
+            detected_namespaces = {
+                str(namespace).strip().lower()
+                for namespace in source.get("detected_namespaces", [])
+                if str(namespace).strip()
+            }
+            selected_namespaces = sorted(detected_namespaces & GTO_TRANSLATIONS_PRIORITY_NAMESPACES)
+            if not selected_namespaces:
+                continue
+            source["merge_priority"] = 30
+            source["include_namespaces"] = selected_namespaces
+            source["source_role"] = "gto_translations_priority_lang"
+            selected_sources.append(source)
+            selected_from_repo += 1
+        discoveries.append(
+            {
+                "repo_root": str(local_repo.resolve()),
+                "resourcepack_discoveries": pack_discoveries,
+                "selected_source_count": selected_from_repo,
+            }
+        )
+    return selected_sources, discoveries
+
+
+def _instance_mod_archive_sources(
+    instance_root: Path,
+    *,
+    locale: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    mods = discover_mod_archives(instance_root / "mods", source_id="mods-folder")
+    sources = _instance_sources_from_discovery(
+        mods,
+        output_kind="resourcepack",
+        output_root_factory=lambda entry: "resourcepack",
+    )
+    for source in sources:
+        source["merge_priority"] = 20
+        source["exclude_namespaces"] = sorted(GTO_TRANSLATIONS_PRIORITY_NAMESPACES)
+        source["source_role"] = "instance_mod_archive"
+    return sources, mods
+
+
 def build_gto_workflow_manifest(
     instance_root: Path,
     *,
@@ -2100,53 +2188,23 @@ def build_gto_workflow_manifest(
 ) -> dict[str, Any]:
     instance_root = instance_root.resolve()
     repo_root = repo_root.resolve()
-    repo_sources: list[dict[str, Any]] = []
-    repo_discovery: list[dict[str, Any]] = []
+    repo_sources, repo_discovery = _selected_gto_translation_repo_sources(repo_root, locale=locale)
+    instance_sources, instance_mods = _instance_mod_archive_sources(instance_root, locale=locale)
 
-    for local_repo in _direct_repo_roots(repo_root):
-        if local_repo == instance_root:
-            continue
-        pack_sources, pack_discoveries = _discover_repo_resourcepack_sources(
-            local_repo,
-            locale=locale,
-            source_prefix=f"repo-pack:{local_repo.name}",
-        )
-        local_manifest = build_local_manifest(
-            local_repo,
-            pack_description=pack_description,
-            pack_format=pack_format,
-            include_vanilla=False,
-            minecraft_version=minecraft_version,
-            locale=locale,
-        )
-        local_sources = [
-            source
-            for source in list(local_manifest.get("sources", []))
-            if not _source_is_resourcepack_only_repo_source(source)
-        ]
-        for source in local_sources:
-            source["merge_priority"] = 10
-        repo_sources.extend(local_sources)
-        repo_sources.extend(pack_sources)
-        repo_discovery.append(
+    sources: list[dict[str, Any]] = []
+    if include_vanilla:
+        sources.append(
             {
-                "repo_root": str(local_repo.resolve()),
-                "local_manifest_sources": len(local_sources),
-                "resourcepack_discoveries": pack_discoveries,
+                "id": f"minecraft-vanilla-{minecraft_version}",
+                "type": "minecraft_assets",
+                "minecraft_version": minecraft_version,
+                "locale": locale,
+                "target_namespace": "minecraft",
+                "merge_priority": 10,
             }
         )
-
-    instance_manifest = build_instance_manifest(
-        instance_root,
-        pack_description=pack_description,
-        pack_format=pack_format,
-        include_vanilla=include_vanilla,
-        minecraft_version=minecraft_version,
-        locale=locale,
-    )
-    instance_sources = list(instance_manifest.get("sources", []))
-    for source in instance_sources:
-        source["merge_priority"] = 20
+    sources.extend(repo_sources)
+    sources.extend(instance_sources)
 
     return {
         "pack": {
@@ -2156,19 +2214,24 @@ def build_gto_workflow_manifest(
         "build": {
             "include_generated_by_default": True,
             "include_pending_by_default": True,
-            "target_layout": "instance",
+            "target_layout": "resourcepack",
         },
         "workflow": {
             "type": "gto_instance_repo_merge",
             "instance_root": str(instance_root),
             "repo_root": str(repo_root),
-            "merge_rule": "instance_wins_on_duplicate_output_keys",
+            "merge_rule": "gto_translations_repo_supplies_gto_namespaces_instance_mod_archives_supply_everything_else",
         },
         "discovery": {
             "repo_sources": repo_discovery,
-            "instance": instance_manifest.get("discovery", {}),
+            "instance_mod_archives": instance_mods,
+            "skipped_instance_content_roots": [
+                "config/ftbquests/quests",
+                "config/openloader/resources",
+                "resourcepacks",
+            ],
         },
-        "sources": repo_sources + instance_sources,
+        "sources": sources,
     }
 
 

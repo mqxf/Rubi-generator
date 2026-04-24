@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from rubi_gto.annotator import strip_rubi
@@ -11,6 +12,15 @@ from rubi_gto.sources import build_gto_workflow_manifest, build_instance_manifes
 def _write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _write_archive(path: Path, *, files: dict[str, str], mods_toml: str | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as archive:
+        if mods_toml is not None:
+            archive.writestr("META-INF/mods.toml", mods_toml)
+        for name, content in sorted(files.items()):
+            archive.writestr(name, content)
 
 
 class PipelineTests(unittest.TestCase):
@@ -882,18 +892,36 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertEqual(lang_payload["gto.escaped.quests.quest_a.title"], 'Quote "A" %s')
 
-    def test_gto_workflow_merge_prefers_instance_on_duplicate_keys(self) -> None:
+    def test_gto_workflow_uses_repo_translations_for_gto_namespaces_and_instance_mods_for_others(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             instance_root = root / "GregTech-Odyssey"
             (instance_root / ".git").mkdir(parents=True, exist_ok=True)
-            _write_json(
-                instance_root / "resourcepacks" / "instancepack" / "pack.mcmeta",
-                {"pack": {"description": "Instance pack", "pack_format": 34}},
+            _write_archive(
+                instance_root / "mods" / "gto-example.jar",
+                mods_toml='[[mods]]\nmodId = "gto"\n',
+                files={
+                    "assets/gto/lang/ja_jp.json": json.dumps(
+                        {"dup.key": "インスタンス", "instance.only": "現地"},
+                        ensure_ascii=False,
+                    )
+                },
             )
+            _write_archive(
+                instance_root / "mods" / "othermod.jar",
+                mods_toml='[[mods]]\nmodId = "othermod"\n',
+                files={
+                    "assets/othermod/lang/ja_jp.json": json.dumps(
+                        {"other.key": "別翻訳"},
+                        ensure_ascii=False,
+                    )
+                },
+            )
+            (instance_root / "config" / "ftbquests" / "quests").mkdir(parents=True, exist_ok=True)
+            (instance_root / "config" / "ftbquests" / "quests" / "data.snbt").write_text("{}", encoding="utf-8")
             _write_json(
-                instance_root / "resourcepacks" / "instancepack" / "assets" / "gto" / "lang" / "ja_jp.json",
-                {"dup.key": "インスタンス", "instance.only": "現地"},
+                instance_root / "config" / "openloader" / "resources" / "quests" / "pack.mcmeta",
+                {"pack": {"description": "Quest pack", "pack_format": 34}},
             )
 
             translations_repo = root / "GTO-Translations"
@@ -913,6 +941,17 @@ class PipelineTests(unittest.TestCase):
                 / "ja_jp.json",
                 {"dup.key": "リポジトリ", "repo.only": "翻訳"},
             )
+            _write_json(
+                translations_repo
+                / "ja_jp"
+                / "resourcepacks"
+                / "gto-lang-ja_jp"
+                / "assets"
+                / "gtocore"
+                / "lang"
+                / "ja_jp.json",
+                {"core.key": "中核翻訳"},
+            )
 
             _write_json(root / "review" / "glossary.json", {"terms": []})
             _write_json(root / "review" / "review_entries.json", {})
@@ -925,16 +964,24 @@ class PipelineTests(unittest.TestCase):
             _write_json(root / "manifest.json", manifest)
 
             summary = run(root / "manifest.json", root)
-            merged = json.loads(
-                (root / "build" / "staged" / "resourcepack" / "assets" / "gto" / "lang" / "ja_jp.json").read_text(
+            merged = json.loads((root / "build" / "resourcepack" / "assets" / "gto" / "lang" / "ja_jp.json").read_text(encoding="utf-8"))
+            other = json.loads(
+                (root / "build" / "resourcepack" / "assets" / "othermod" / "lang" / "ja_jp.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            core = json.loads(
+                (root / "build" / "resourcepack" / "assets" / "gtocore" / "lang" / "ja_jp.json").read_text(
                     encoding="utf-8"
                 )
             )
 
-            self.assertEqual(summary["build"]["target_layout"], "instance")
-            self.assertEqual(strip_rubi(merged["dup.key"]), "インスタンス")
+            self.assertEqual(summary["build"]["target_layout"], "resourcepack")
+            self.assertEqual(strip_rubi(merged["dup.key"]), "リポジトリ")
             self.assertEqual(strip_rubi(merged["repo.only"]), "翻訳")
-            self.assertEqual(strip_rubi(merged["instance.only"]), "現地")
+            self.assertNotIn("instance.only", merged)
+            self.assertEqual(strip_rubi(other["other.key"]), "別翻訳")
+            self.assertEqual(strip_rubi(core["core.key"]), "中核翻訳")
 
     def test_ftbquests_locale_snbt_overwrite_and_full_pack_block(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
